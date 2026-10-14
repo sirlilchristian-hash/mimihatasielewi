@@ -1096,6 +1096,7 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
             price: numericPrice,
             status: status,
             file_path: storagePath,
+            total_pages: truePageCount,
           },
         ])
         .select()
@@ -1164,6 +1165,7 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
 
           // 2. Validate & Merge PDFs: existing PDF pages first, new uploaded PDF pages second
           let mergedPdfBytes: Uint8Array;
+          let totalPages = 0;
           try {
             const existingDoc = await PDFDocument.load(existingBytes);
             const newDoc = await PDFDocument.load(newBytes);
@@ -1178,6 +1180,9 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
             newPages.forEach((p) => mergedDoc.addPage(p));
 
             mergedPdfBytes = await mergedDoc.save();
+            // Calculate total pages
+            const mergedPdfDocObj = await PDFDocument.load(mergedPdfBytes);
+            totalPages = mergedPdfDocObj.getPageCount();
           } catch (mergeErr: any) {
             console.error("PDF merge processing error:", mergeErr);
             return res.status(400).json({
@@ -1210,6 +1215,7 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
               price: numericPrice,
               status: status,
               file_path: mergedStoragePath,
+              total_pages: totalPages,
             })
             .eq("id", paperId)
             .select()
@@ -1276,6 +1282,7 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
             price: numericPrice,
             status: status,
             file_path: newStoragePath,
+            total_pages: truePageCount,
           })
           .eq("id", paperId)
           .select()
@@ -1574,6 +1581,21 @@ app.delete("/api/papers/:id", requireAdmin, requireRole(["super_admin", "content
   }
 
   try {
+    // Check for dependent orders
+    const { count, error: orderCheckErr } = await supabaseAdmin
+      .from("Orders")
+      .select("id", { count: "exact", head: true })
+      .eq("paper_id", id);
+
+    if (orderCheckErr) {
+        console.error(`[Delete Paper] Dependency check error for ID ${id}:`, orderCheckErr);
+        return res.status(500).json({ error: "Failed to check paper dependencies" });
+    }
+
+    if (count && count > 0) {
+        return res.status(409).json({ error: "Cannot delete paper: it has associated orders." });
+    }
+
     // 1. Retrieve the existing paper record from public."Papers" by ID
     const { data: paper, error: fetchErr } = await supabaseAdmin
       .from("Papers")
@@ -2076,14 +2098,16 @@ app.post("/api/free-purchase", async (req, res) => {
         amount: 0,
         status: 'paid', // Mark as paid for fulfillment
         purchased_pages: freePurchasedPages,
-        page_quantity: freePageQuantity,
-        unit_price: 0,
-        total_amount: 0
+        page_quantity: freePageQuantity
     }).select("id").single();
     
     if (orderErr || !newOrder) {
-      console.error("Order creation error in free-purchase:", orderErr);
-      return res.status(500).json({ success: false, error: "Failed to create order." });
+      console.error("Order creation error in free-purchase:");
+      console.error("Message:", orderErr?.message);
+      console.error("Code:", orderErr?.code);
+      console.error("Details:", orderErr?.details);
+      console.error("Hint:", orderErr?.hint);
+      return res.status(500).json({ success: false, error: "ORDER_CREATION_FAILED" });
     }
 
     try {
@@ -2127,6 +2151,7 @@ app.post("/api/free-purchase", async (req, res) => {
     } catch (mailErr: any) {
       emailStatus = 'failed';
       emailError = mailErr?.message || 'Email delivery exception';
+      console.error("[FREE PURCHASE] Email delivery exception:", emailError);
     }
 
     return res.json({ 

@@ -533,8 +533,19 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
           phone: phone.trim() || '0000000000',
         }),
       });
+      
       const data = await res.json();
-      if (res.ok && data.success) {
+      
+      if (!res.ok) {
+        if (data.error === 'ORDER_CREATION_FAILED') {
+          setPaymentErrors({ general: 'System error: Failed to create order. Please contact support.' });
+        } else {
+          setPaymentErrors({ general: data.error || 'Failed to complete free access request.' });
+        }
+        return;
+      }
+
+      if (data.success) {
         setCurrentOrderId(data.orderId);
         setAccessToken(data.accessToken);
         setStep(5);
@@ -542,7 +553,7 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
         setPaymentErrors({ general: data.error || 'Failed to complete free access request.' });
       }
     } catch (err) {
-      setPaymentErrors({ general: 'Network error. Please try again.' });
+      setPaymentErrors({ general: 'Network connection error. Please check your internet connection and try again.' });
     } finally {
       setIsInitiatingPayment(false);
       submittingRef.current = false;
@@ -636,7 +647,7 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
       // Guard remains LOCKED - Never unlock on uncertain/ambiguous outcomes
     } catch (err: any) {
       setPaymentErrors({ 
-        general: 'Network error initiating payment. Please check your phone, do not retry, and contact support if needed.' 
+        general: 'Network connection error. Please check your internet connection, do not retry, and contact support if needed.' 
       });
       setIsInitiatingPayment(false);
       setIsUncertain(true);

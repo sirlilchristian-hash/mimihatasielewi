@@ -15,6 +15,7 @@ import {
   generateAccessToken,
   verifyAccessToken
 } from './server.ts';
+import { getSmtpConfig, sendActivationEmail, setSmtpTransporter } from './emailService.ts';
 
 // ---------------------------------------------------------
 // Existing Phase 1-4 Baseline Tests
@@ -515,3 +516,52 @@ test('19. Phase 5 - generatePageSpecificPDF helper validates bounds and maintain
 });
 
 console.log('All automated tests executed successfully.');
+
+test('20. SMTP Configuration Resolution', () => {
+  const originalEnv = { ...process.env };
+  process.env.SMTP_USER = 'test@gmail.com';
+  process.env.SMTP_PASSWORD = 'password';
+  
+  const config = getSmtpConfig();
+  assert.strictEqual(config.smtpUser, 'test@gmail.com');
+  assert.strictEqual(config.userConfigured, true);
+  
+  process.env = originalEnv;
+});
+
+test('21. Email Failure with Missing Config', async () => {
+  const originalEnv = { ...process.env };
+  delete process.env.SMTP_USER;
+  
+  const result = await sendActivationEmail({
+    to: 'test@example.com',
+    firstName: 'Test',
+    paperTitle: 'Test Paper',
+    openDocumentUrl: 'http://example.com'
+  });
+  
+  assert.strictEqual(result.status, 'EMAIL NOT CONFIGURED');
+  
+  process.env = originalEnv;
+});
+
+test('22. Successful Email Sending with Mocked Transport', async () => {
+  setSmtpTransporter({
+    sendMail: async () => ({ messageId: 'mock-id' })
+  });
+  
+  process.env.SMTP_USER = 'test@gmail.com';
+  process.env.SMTP_PASSWORD = 'password';
+
+  const result = await sendActivationEmail({
+    to: 'test@example.com',
+    firstName: 'Test',
+    paperTitle: 'Test Paper',
+    openDocumentUrl: 'http://example.com'
+  });
+  
+  assert.strictEqual(result.success, true);
+  assert.strictEqual(result.messageId, 'mock-id');
+  
+  setSmtpTransporter(null); // Clean up
+});

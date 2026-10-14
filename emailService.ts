@@ -94,7 +94,15 @@ export function getSmtpConfig(): SmtpConfigDetails {
 /**
  * Creates a Nodemailer transport instance using the resolved configuration.
  */
+let _transporter: any = null;
+
+export function setSmtpTransporter(t: any) {
+  _transporter = t;
+}
+
 export function createSmtpTransporter() {
+  if (_transporter) return _transporter;
+
   const { smtpUser, smtpPassword, host, port, secure, userConfigured, passwordConfigured } = getSmtpConfig();
 
   if (!userConfigured || !passwordConfigured || !smtpUser || !smtpPassword) {
