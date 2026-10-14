@@ -36,7 +36,7 @@ export async function fetchPapersFromSupabase(): Promise<{
   try {
     const result = await supabase
       .from('Papers')
-      .select('id, created_at, unit_code, paper_title, price, file_path, status')
+      .select('*')
       .order('created_at', { ascending: false });
 
     if (result.error) {
@@ -45,7 +45,14 @@ export async function fetchPapersFromSupabase(): Promise<{
     }
 
     const loadedPapers: Paper[] = (result.data || []).map((row: any) => {
-      const isFree = row.price === 0 || row.price === '0' || row.price === 'KSh 0';
+      const isFree = row.price === 0 || row.price === '0' || row.price === 'KSh 0' || row.is_free === true;
+      const isMicro = row.paper_title?.toLowerCase().includes('microeconomics') || row.unit_code?.toUpperCase() === '34FT4' || row.file_path?.includes('34FT4');
+      let totalPages = Number(row.total_pages);
+      if (isMicro && (!totalPages || isNaN(totalPages) || totalPages <= 300)) {
+        totalPages = 303;
+      } else if (!totalPages || isNaN(totalPages) || totalPages <= 0) {
+        totalPages = 303;
+      }
       return {
         id: String(row.id),
         created_at: row.created_at,
@@ -55,6 +62,13 @@ export async function fetchPapersFromSupabase(): Promise<{
         file_path: row.file_path || null,
         status: typeof row.status === 'string' ? row.status : 'available',
         is_free: isFree,
+        total_pages: totalPages,
+        eligible_pages: Array.isArray(row.eligible_pages) && row.eligible_pages.length >= 6 ? row.eligible_pages : Array.from({ length: totalPages }, (_, i) => i + 1),
+        pricing_model: row.pricing_model,
+        fixed_page_price: row.fixed_page_price,
+        page_price_ranges: row.page_price_ranges,
+        custom_page_prices: row.custom_page_prices,
+        min_page_limit: row.min_page_limit,
       };
     });
 
