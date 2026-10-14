@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+.env.*
+.git
+.gitignore
+npm-debug.log
+.order_emails.json
+.github_connection.json
