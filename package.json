@@ -30,8 +30,7 @@
     "pdf-lib": "^1.17.1",
     "pg": "^8.23.0",
     "react": "^19.0.1",
-    "react-dom": "^19.0.1",
-    "vite": "^6.2.3"
+    "react-dom": "^19.0.1"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
