@@ -101,7 +101,7 @@ function getDocumentAccessUrl(req: express.Request, token: string): string {
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 8080;
 
 // Configure Multer memory storage for PDF file uploads (25MB limit)
 const upload = multer({
