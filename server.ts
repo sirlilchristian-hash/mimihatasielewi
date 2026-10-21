@@ -4140,7 +4140,25 @@ app.post("/api/document/register-device", async (req, res) => {
     });
     
     if (insertErr) {
-        console.error("Device registration insert error:", insertErr);
+        // If primary key collision (downloads_pkey / 23505) occurs, check if deviceId already registered for this order
+        if (insertErr.code === '23505' || String(insertErr.message || '').includes('downloads_pkey') || String(insertErr.message || '').includes('duplicate key')) {
+            const { data: existingRec } = await supabaseAdmin.from('downloads')
+              .select('id, order_id')
+              .eq('id', deviceId)
+              .maybeSingle();
+            
+            if (existingRec && existingRec.order_id === orderId) {
+                // Idempotent success
+                console.log(`[ACCESS LOG] Idempotent device registration success for order ${orderId} on device ${deviceId}`);
+                res.setHeader('Set-Cookie', `device_id=${deviceId}; HttpOnly; Path=/; Max-Age=315360000; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
+                return res.json({ success: true });
+            } else {
+                console.warn(`[ACCESS LOG] Device ID collision across orders for device ${deviceId}`);
+                return res.status(400).json({ error: "Device identifier conflict. Please try again." });
+            }
+        }
+
+        console.error("Device registration insert error:", { code: insertErr.code, message: insertErr.message });
         return res.status(500).json({ error: "Registration failed." });
     }
     

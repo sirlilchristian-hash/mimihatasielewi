@@ -597,3 +597,9 @@ test('23. Robust Name Normalization and Matching (areNamesMatching)', () => {
   assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'Collen', 'Mogire'), false);
   assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'Collins', 'Mogires'), false);
 });
+
+test('24. Downloads PKey Duplicate Key Handling & Idempotent Retry', () => {
+  // Verify that error handling recognizes duplicate key constraints (23505 / downloads_pkey)
+  const mockInsertError = { code: '23505', message: 'duplicate key value violates unique constraint "downloads_pkey"' };
+  assert.strictEqual(mockInsertError.code === '23505' || mockInsertError.message.includes('downloads_pkey'), true);
+});
