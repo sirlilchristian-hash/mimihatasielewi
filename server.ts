@@ -4131,9 +4131,8 @@ app.post("/api/document/register-device", async (req, res) => {
         return res.status(400).json({ error: `Device limit reached. This document has already been registered on ${limit} devices.` });
     }
     
-    // 4. Register new device using the REAL orderId
+    // 4. Register new device using the REAL orderId (omitting id so db auto-generates UUID primary key)
     const { error: insertErr } = await supabaseAdmin.from('downloads').insert({
-        id: deviceId,
         order_id: orderId,
         paper_id: order.paper_id,
         downloaded_at: new Date().toISOString()
