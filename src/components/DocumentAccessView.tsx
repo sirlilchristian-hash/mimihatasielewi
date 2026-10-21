@@ -183,10 +183,13 @@ export function DocumentAccessView() {
 
           {error && (
             <button
-              onClick={() => window.location.href = '/'}
-              className="w-full py-3 bg-slate-100 hover:bg-slate-200 text-slate-900 font-bold rounded-xl transition-all"
+              onClick={() => {
+                setError('');
+                setRequireNames(true);
+              }}
+              className="w-full py-3 bg-[#00D26A] hover:bg-[#00b85c] text-white font-bold rounded-xl transition-all shadow-md cursor-pointer"
             >
-              Return Home
+              Try Again
             </button>
           )}
         </div>

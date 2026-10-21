@@ -13,7 +13,8 @@ import {
   getAuthoritativeRestrictedPdf,
   getSynthetic303PagePdf,
   generateAccessToken,
-  verifyAccessToken
+  verifyAccessToken,
+  areNamesMatching
 } from './server.ts';
 import { getSmtpConfig, sendActivationEmail, setSmtpTransporter } from './emailService.ts';
 
@@ -564,4 +565,35 @@ test('22. Successful Email Sending with Mocked Transport', async () => {
   assert.strictEqual(result.messageId, 'mock-id');
   
   setSmtpTransporter(null); // Clean up
+});
+
+test('23. Robust Name Normalization and Matching (areNamesMatching)', () => {
+  // Exact match
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'Collins', 'Mogire'), true);
+
+  // Case differences
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'COLLINS', 'mogire'), true);
+  assert.strictEqual(areNamesMatching('COLLINS', 'MOGIRE', 'collins', 'Mogire'), true);
+
+  // Leading, trailing, and repeated whitespace, tabs, newlines
+  assert.strictEqual(areNamesMatching('  Collins  ', '\tMogire\n', 'Collins', 'Mogire'), true);
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', '  Collins   ', '  Mogire  '), true);
+  assert.strictEqual(areNamesMatching('John   Doe', 'Smith', 'John Doe', 'Smith'), true);
+
+  // Unicode normalization (NFKC)
+  assert.strictEqual(areNamesMatching('Café', 'Résumé', 'cafe\u0301', 'Resume'), true);
+
+  // Incorrect first or second names
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'Brian', 'Mogire'), false);
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'Collins', 'Kamau'), false);
+
+  // Empty or missing inputs
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', '', 'Mogire'), false);
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'Collins', ''), false);
+  assert.strictEqual(areNamesMatching('', '', 'Collins', 'Mogire'), false);
+  assert.strictEqual(areNamesMatching(null, undefined, 'Collins', 'Mogire'), false);
+
+  // Similar names belonging to different customers (strict separation)
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'Collen', 'Mogire'), false);
+  assert.strictEqual(areNamesMatching('Collins', 'Mogire', 'Collins', 'Mogires'), false);
 });

@@ -3844,7 +3844,7 @@ app.post("/api/document/find", async (req, res) => {
       .from("payments")
       .select("id, mpesa_receipt, status, order_id")
       .eq("mpesa_receipt", codeUpper)
-      .in("status", ["completed", "manual_used"])
+      .in("status", ["completed", "manual_used", "free"])
       .maybeSingle();
 
     if (paymentErr || !payment || !payment.order_id) {
@@ -3862,16 +3862,8 @@ app.post("/api/document/find", async (req, res) => {
       return res.status(404).json({ error: "No valid paid order found for this transaction." });
     }
 
-    // 3. Verify customer details match
-    const cust = Array.isArray(order.customers) ? order.customers[0] : order.customers;
-    if (!cust) {
-      return res.status(404).json({ error: "Customer details could not be verified." });
-    }
-
-    const targetFirst = (cust.first_name || "").trim().toLowerCase();
-    const targetSecond = (cust.second_name || "").trim().toLowerCase();
-
-    if (targetFirst !== inputFirst || targetSecond !== inputSecond) {
+    // 3. Verify customer details match using areNamesMatching
+    if (!areNamesMatching(cust.first_name, cust.second_name, firstName, secondName)) {
       return res.status(400).json({ error: "The names provided do not match the details used for this purchase." });
     }
 
@@ -4102,12 +4094,8 @@ app.post("/api/document/register-device", async (req, res) => {
     const cust = Array.isArray(order.customers) ? order.customers[0] : order.customers;
     if (!cust) return res.status(400).json({ error: "Customer data missing." });
     
-    const targetFirst = (cust.first_name || '').trim().toLowerCase();
-    const targetSecond = (cust.second_name || '').trim().toLowerCase();
-    const inputFirst = (firstName || '').trim().toLowerCase();
-    const inputSecond = (secondName || '').trim().toLowerCase();
-    
-    if (targetFirst !== inputFirst || targetSecond !== inputSecond) {
+    // Verify customer details match using areNamesMatching
+    if (!areNamesMatching(cust.first_name, cust.second_name, firstName, secondName)) {
         console.warn(`[ACCESS LOG] Failed device registration for order ${orderId}. Name mismatch.`);
         return res.status(400).json({ error: "These details do not match the information used for this purchase." });
     }
@@ -4741,4 +4729,36 @@ async function startServer() {
 
 if (process.env.NODE_ENV !== "test") {
   startServer();
+}
+
+// Shared robust name normalization and strict matching helper
+export function areNamesMatching(
+  storedFirst: string | null | undefined,
+  storedSecond: string | null | undefined,
+  inputFirst: string | null | undefined,
+  inputSecond: string | null | undefined
+): boolean {
+  if (!storedFirst || !storedSecond || !inputFirst || !inputSecond) {
+    return false;
+  }
+
+  const normalize = (val: string) => 
+    String(val)
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') // strip combining accents for accent-insensitive robust matching
+      .normalize('NFKC')
+      .replace(/[\s\t\r\n\u00A0]+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+  const targetFirst = normalize(storedFirst);
+  const targetSecond = normalize(storedSecond);
+  const userFirst = normalize(inputFirst);
+  const userSecond = normalize(inputSecond);
+
+  if (!targetFirst || !targetSecond || !userFirst || !userSecond) {
+    return false;
+  }
+
+  return targetFirst === userFirst && targetSecond === userSecond;
 }
