@@ -101,7 +101,18 @@ function getDocumentAccessUrl(req: express.Request, token: string): string {
 dotenv.config();
 
 const app = express();
-const PORT = Number(process.env.PORT) || 8080;
+function getPort(): number {
+  const portArgIndex = process.argv.indexOf('--port');
+  if (portArgIndex !== -1 && process.argv[portArgIndex + 1]) {
+    const parsed = Number(process.argv[portArgIndex + 1]);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  if (process.env.NODE_ENV === 'production' && process.env.PORT) {
+    return Number(process.env.PORT);
+  }
+  return 3000;
+}
+const PORT = getPort();
 
 // Configure Multer memory storage for PDF file uploads (25MB limit)
 const upload = multer({
@@ -109,16 +120,50 @@ const upload = multer({
   limits: { fileSize: 25 * 1024 * 1024 },
 });
 
-// Initialize Supabase Server Admin Client
-const rawSupabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || 'https://cwbcyhhqoezyobibwcdx.supabase.co';
-const supabaseUrl = rawSupabaseUrl.replace(/\/rest\/v1\/?$/, '').replace(/\/$/, '');
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
+// Initialize Supabase Server Admin Client with strict service_role validation (no anonymous key fallback)
+export function validateSupabaseConfig(
+  supabaseUrlEnv?: string, 
+  supabaseServiceKeyEnv?: string, 
+  supabaseAnonKeyEnv?: string,
+  isTestMode = false
+): { url: string; serviceKey: string } {
+  const rawUrl = supabaseUrlEnv || '';
+  const url = rawUrl.replace(/\/rest\/v1\/?$/, '').replace(/\/$/, '');
+  const serviceKey = (supabaseServiceKeyEnv || '').trim();
+  const anonKey = (supabaseAnonKeyEnv || '').trim();
 
-if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn("WARNING: SUPABASE_SERVICE_ROLE_KEY is not set. Using VITE_SUPABASE_ANON_KEY for development fallback.");
+  if (!url) {
+    const err = "FATAL: SUPABASE_URL (or VITE_SUPABASE_URL) environment variable is required.";
+    if (!isTestMode) throw new Error(err);
+    console.warn(err);
+  }
+
+  if (serviceKey === anonKey && serviceKey !== '') {
+    const err = "FATAL: SUPABASE_SERVICE_ROLE_KEY must not be equal to VITE_SUPABASE_ANON_KEY. Anonymous key fallback is strictly prohibited.";
+    if (!isTestMode) throw new Error(err);
+    console.warn(err);
+  }
+
+  if (!serviceKey) {
+    const err = "FATAL: SUPABASE_SERVICE_ROLE_KEY is required for privileged server operations. Anonymous key fallback is strictly prohibited.";
+    if (!isTestMode) throw new Error(err);
+    console.warn(err);
+  }
+
+  return {
+    url: url || 'https://placeholder.supabase.co',
+    serviceKey: serviceKey || 'placeholder-service-role-key'
+  };
 }
 
-const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+const evaluatedConfig = validateSupabaseConfig(
+  process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  process.env.VITE_SUPABASE_ANON_KEY,
+  process.env.NODE_ENV !== 'production'
+);
+
+const supabaseAdmin = createClient(evaluatedConfig.url, evaluatedConfig.serviceKey, {
   auth: {
     persistSession: false,
     autoRefreshToken: false,
@@ -3654,6 +3699,7 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
         .insert({
           order_id: order.id,
           paper_id: order.paper_id,
+          download_type: 'direct_pdf',
           downloaded_at: new Date().toISOString()
         });
     } catch (dlErr) {
@@ -3863,6 +3909,11 @@ app.post("/api/document/find", async (req, res) => {
     }
 
     // 3. Verify customer details match using areNamesMatching
+    const cust = Array.isArray(order.customers) ? order.customers[0] : order.customers;
+    if (!cust) {
+      return res.status(404).json({ error: "Customer details could not be verified." });
+    }
+
     if (!areNamesMatching(cust.first_name, cust.second_name, firstName, secondName)) {
       return res.status(400).json({ error: "The names provided do not match the details used for this purchase." });
     }
@@ -3883,18 +3934,26 @@ app.post("/api/document/find", async (req, res) => {
     let hasPendingRequest = false;
     let deviceCount = 0;
 
-    const { data: dls } = await supabaseAdmin.from('downloads').select('id').eq('order_id', order.id);
-    if (dls) {
-        const uniqueDevices = new Set(dls.map(d => d.id));
-        deviceCount = uniqueDevices.size;
+    const dls = await getOrderDownloads(order.id);
+    deviceCount = getDistinctDeviceCount(dls);
+
+    const { data: reqs, error: reqErr } = await supabaseAdmin
+      .from('device_requests')
+      .select('id, status')
+      .eq('order_id', order.id)
+      .eq('status', 'approved');
+
+    if (!reqErr && reqs) {
+        const approvedCount = new Set(reqs.map(r => r.id)).size;
+        deviceLimit = Math.min(3 + approvedCount, 5);
     }
 
-    const { data: reqs, error: reqErr } = await supabaseAdmin.from('device_requests').select('status').eq('order_id', order.id);
-    if (!reqErr && reqs) {
-        const approved = reqs.filter(r => r.status === 'approved').length;
-        deviceLimit = 3 + approved;
-        hasPendingRequest = reqs.some(r => r.status === 'pending');
-    }
+    const { data: pendingReqs } = await supabaseAdmin
+      .from('device_requests')
+      .select('id')
+      .eq('order_id', order.id)
+      .eq('status', 'pending');
+    hasPendingRequest = Boolean(pendingReqs && pendingReqs.length > 0);
 
     // 6. Generate existing AES-256-GCM protected access token
     const accessToken = generateAccessToken(order.id);
@@ -3945,6 +4004,11 @@ app.post("/api/document/request-device", async (req, res) => {
         return res.status(400).json({ error: "You already have a pending request for this document." });
     }
 
+    const approvedCount = reqs ? new Set(reqs.filter((r: any) => r.status === 'approved').map((r: any) => r.id)).size : 0;
+    if (approvedCount >= 2) {
+        return res.status(400).json({ error: "Maximum device limit (5 devices) has already been reached for this order." });
+    }
+
     const { error: insertErr } = await supabaseAdmin.from('device_requests').insert({
         order_id: orderId,
         status: 'pending'
@@ -3987,15 +4051,21 @@ app.get("/api/admin/device-requests", requireAdmin, async (req, res) => {
           }
         }
         
-        // Calculate current devices for each
+        // Calculate current devices and effective limits consistently for each
         const requestsWithCounts = await Promise.all(data.map(async (reqItem: any) => {
-            const { count } = await supabaseAdmin.from('downloads').select('*', { count: 'exact', head: true }).eq('order_id', reqItem.order_id);
-            const { data: approvedReqs } = await supabaseAdmin.from('device_requests').select('id').eq('order_id', reqItem.order_id).eq('status', 'approved');
+            const dls = await getOrderDownloads(reqItem.order_id);
+            const distinctCount = getDistinctDeviceCount(dls);
+            const { data: approvedReqs } = await supabaseAdmin
+                .from('device_requests')
+                .select('id')
+                .eq('order_id', reqItem.order_id)
+                .eq('status', 'approved');
+            const approvedCount = approvedReqs ? new Set(approvedReqs.map((r: any) => r.id)).size : 0;
             const paper = reqItem.Orders?.paper_id ? paperMap.get(reqItem.Orders.paper_id) : null;
             return {
                 ...reqItem,
-                current_devices: count || 0,
-                device_limit: 3 + (approvedReqs ? approvedReqs.length : 0),
+                current_devices: distinctCount,
+                device_limit: Math.min(3 + approvedCount, 5),
                 Orders: {
                     customers: reqItem.Orders?.customers || null,
                     Papers: paper ? { paper_title: paper.paper_title, unit_code: paper.unit_code } : null
@@ -4012,26 +4082,76 @@ app.get("/api/admin/device-requests", requireAdmin, async (req, res) => {
 
 app.post("/api/admin/device-requests/:id/approve", requireAdmin, async (req, res) => {
     const { id } = req.params;
-    const { error } = await supabaseAdmin
-        .from('device_requests')
-        .update({ status: 'approved', processed_at: new Date().toISOString() })
-        .eq('id', id)
-        .eq('status', 'pending');
-        
-    if (error) return res.status(500).json({ error: error.message });
-    return res.json({ success: true });
+    
+    // Authoritative atomic approval via approve_device_request RPC (acquires Orders FOR UPDATE lock)
+    // Fails closed if the RPC is unavailable, preventing race conditions across multiple Cloud Run instances.
+    try {
+        const { data: rpcResult, error: rpcErr } = await supabaseAdmin.rpc('approve_device_request', {
+            p_request_id: id
+        });
+
+        if (rpcErr) {
+            console.error('[APPROVE_DEVICE ERROR] RPC execution error:', { code: rpcErr.code, message: rpcErr.message });
+            return res.status(500).json({ error: "Device approval service unavailable. Database update required." });
+        }
+
+        if (rpcResult && typeof rpcResult === 'object') {
+            if (rpcResult.success) {
+                return res.json({ success: true, effectiveLimit: rpcResult.effective_limit });
+            } else if (rpcResult.error === 'maximum_approvals_reached') {
+                return res.status(400).json({ error: "Order has already reached the maximum limit of 5 devices." });
+            } else if (rpcResult.error === 'request_not_pending') {
+                return res.status(409).json({ error: "Request is not in pending state or has already been processed." });
+            } else if (rpcResult.error === 'request_not_found') {
+                return res.status(404).json({ error: "Device request not found." });
+            } else if (rpcResult.error === 'order_not_found') {
+                return res.status(404).json({ error: "Parent order not found." });
+            } else {
+                return res.status(400).json({ error: rpcResult.error || "Failed to approve request." });
+            }
+        }
+
+        return res.status(500).json({ error: "Device approval service unavailable. Database update required." });
+    } catch (e: any) {
+        console.error('[APPROVE_DEVICE ERROR] Unexpected RPC exception:', e?.message || e);
+        return res.status(500).json({ error: "Device approval service unavailable." });
+    }
 });
 
 app.post("/api/admin/device-requests/:id/reject", requireAdmin, async (req, res) => {
     const { id } = req.params;
-    const { error } = await supabaseAdmin
-        .from('device_requests')
-        .update({ status: 'rejected', processed_at: new Date().toISOString() })
-        .eq('id', id)
-        .eq('status', 'pending');
-        
-    if (error) return res.status(500).json({ error: error.message });
-    return res.json({ success: true });
+
+    // Authoritative atomic rejection via reject_device_request RPC (acquires Orders FOR UPDATE lock)
+    // Fails closed if the RPC is unavailable, preventing non-atomic state updates across multiple Cloud Run instances.
+    try {
+        const { data: rpcResult, error: rpcErr } = await supabaseAdmin.rpc('reject_device_request', {
+            p_request_id: id
+        });
+
+        if (rpcErr) {
+            console.error('[REJECT_DEVICE ERROR] RPC execution error:', { code: rpcErr.code, message: rpcErr.message });
+            return res.status(500).json({ error: "Device rejection service unavailable. Database update required." });
+        }
+
+        if (rpcResult && typeof rpcResult === 'object') {
+            if (rpcResult.success) {
+                return res.json({ success: true });
+            } else if (rpcResult.error === 'request_not_found') {
+                return res.status(404).json({ error: "Device request not found." });
+            } else if (rpcResult.error === 'request_not_pending') {
+                return res.status(409).json({ error: "Request is not in pending state or has already been processed." });
+            } else if (rpcResult.error === 'order_not_found') {
+                return res.status(404).json({ error: "Parent order not found." });
+            } else {
+                return res.status(400).json({ error: rpcResult.error || "Failed to reject request." });
+            }
+        }
+
+        return res.status(500).json({ error: "Device rejection service unavailable. Database update required." });
+    } catch (e: any) {
+        console.error('[REJECT_DEVICE ERROR] Unexpected RPC exception:', e?.message || e);
+        return res.status(500).json({ error: "Device rejection service unavailable." });
+    }
 });
 
 app.post("/api/document/verify", async (req, res) => {
@@ -4054,25 +4174,26 @@ app.post("/api/document/verify", async (req, res) => {
     const match = cookies.match(/(?:^|; )device_id=([^;]*)/);
     const deviceId = match ? match[1] : null;
     
-    const { data: dls } = await supabaseAdmin.from('downloads')
-      .select('id')
-      .eq('order_id', orderId)
-      .order('downloaded_at', { ascending: true });
+    const devices = await getOrderDownloads(orderId);
     
-    const devices = dls || [];
-    
-    if (deviceId && devices.some(d => d.id === deviceId)) {
+    if (deviceId && isDeviceAuthorizedForOrder(devices, deviceId)) {
         console.log(`[ACCESS LOG] Successful access to order ${orderId} by device ${deviceId}`);
         return res.json({ success: true });
     }
     
     let limit = 3;
-    const { data: reqs, error: reqErr } = await supabaseAdmin.from('device_requests').select('status').eq('order_id', orderId);
+    const { data: reqs, error: reqErr } = await supabaseAdmin
+        .from('device_requests')
+        .select('id, status')
+        .eq('order_id', orderId);
     if (!reqErr && reqs) {
-        limit += reqs.filter(r => r.status === 'approved').length;
+        const approvedReqs = reqs.filter(r => r.status === 'approved');
+        const approvedCount = new Set(approvedReqs.map((r: any) => r.id)).size;
+        limit = Math.min(3 + approvedCount, 5);
     }
 
-    if (devices.length < limit) {
+    const currentCount = getDistinctDeviceCount(devices);
+    if (currentCount < limit) {
         return res.json({ requireNames: true });
     } else {
         return res.json({ error: `Device limit reached. This document has already been registered on ${limit} devices.` });
@@ -4102,83 +4223,51 @@ app.post("/api/document/register-device", async (req, res) => {
 
     const cookies = req.headers.cookie || '';
     const match = cookies.match(/(?:^|; )device_id=([^;]*)/);
-    let deviceId = match ? match[1] : crypto.randomUUID();
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const candidateCookie = match ? match[1].trim() : '';
+    let deviceId = UUID_REGEX.test(candidateCookie) ? candidateCookie : crypto.randomUUID();
 
-    // 1. Fetch existing registered devices for this order using REAL orderId
-    const { data: existingDls } = await supabaseAdmin.from('downloads')
-      .select('id, order_id')
-      .eq('order_id', orderId)
-      .order('downloaded_at', { ascending: true });
-      
-    const devices = existingDls || [];
-    
-    // 2. Check if THIS device is already registered
-    const isAlreadyRegistered = devices.some(d => d.id === deviceId);
-    if (isAlreadyRegistered) {
-        // ALLOW - Already registered
-        res.setHeader('Set-Cookie', `device_id=${deviceId}; HttpOnly; Path=/; Max-Age=315360000; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
-        return res.json({ success: true });
-    }
-    
-    // 3. New device - check limit
-    let limit = 3;
-    const { data: reqs, error: reqErr } = await supabaseAdmin.from('device_requests').select('status').eq('order_id', orderId);
-    if (!reqErr && reqs) {
-        limit += reqs.filter(r => r.status === 'approved').length;
-    }
+    // Sole registration path: Authoritative atomic registration via register_document_device RPC
+    // Serializes concurrent registrations per order using a row-level lock on public."Orders"
+    try {
+        const { data: rpcResult, error: rpcErr } = await supabaseAdmin.rpc('register_document_device', {
+            p_order_id: orderId,
+            p_paper_id: order.paper_id,
+            p_device_id: deviceId,
+            p_base_limit: 3
+        });
 
-    if (devices.length >= limit) {
-        return res.status(400).json({ error: `Device limit reached. This document has already been registered on ${limit} devices.` });
-    }
-    
-    // 4. Register new device using the REAL orderId (omitting id so db auto-generates UUID primary key)
-    const { error: insertErr } = await supabaseAdmin.from('downloads').insert({
-        order_id: orderId,
-        paper_id: order.paper_id,
-        downloaded_at: new Date().toISOString()
-    });
-    
-    if (insertErr) {
-        // If primary key collision (downloads_pkey / 23505) occurs, check if deviceId already registered for this order
-        if (insertErr.code === '23505' || String(insertErr.message || '').includes('downloads_pkey') || String(insertErr.message || '').includes('duplicate key')) {
-            const { data: existingRec } = await supabaseAdmin.from('downloads')
-              .select('id, order_id')
-              .eq('id', deviceId)
-              .maybeSingle();
-            
-            if (existingRec && existingRec.order_id === orderId) {
-                // Idempotent success
-                console.log(`[ACCESS LOG] Idempotent device registration success for order ${orderId} on device ${deviceId}`);
+        if (rpcErr) {
+            console.error('[REGISTRATION ERROR] Atomic RPC invocation failure:', { code: rpcErr.code, message: rpcErr.message });
+            return res.status(500).json({ error: "Registration service unavailable. Please try again." });
+        }
+
+        if (rpcResult && typeof rpcResult === 'object') {
+            if (rpcResult.success) {
+                console.log(`[ACCESS LOG] Order ${orderId} registered atomically via RPC to device ${deviceId} (${rpcResult.status})`);
                 res.setHeader('Set-Cookie', `device_id=${deviceId}; HttpOnly; Path=/; Max-Age=315360000; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
                 return res.json({ success: true });
+            } else if (rpcResult.error === 'device_limit_reached') {
+                const effectiveLimit = rpcResult.limit || 3;
+                return res.status(400).json({ error: `Device limit reached. This document has already been registered on ${effectiveLimit} devices.` });
+            } else if (rpcResult.error === 'order_not_paid') {
+                return res.status(403).json({ error: "Access denied. Order is not active or awaiting payment confirmation." });
+            } else if (rpcResult.error === 'paper_mismatch') {
+                return res.status(403).json({ error: "Access denied. Paper does not match order entitlement." });
+            } else if (rpcResult.error === 'invalid_device_id') {
+                return res.status(400).json({ error: "Invalid device identifier." });
+            } else if (rpcResult.error === 'order_not_found') {
+                return res.status(404).json({ error: "Order not found." });
             } else {
-                console.warn(`[ACCESS LOG] Device ID collision across orders for device ${deviceId}`);
-                return res.status(400).json({ error: "Device identifier conflict. Please try again." });
+                return res.status(400).json({ error: rpcResult.error || "Registration rejected." });
             }
         }
 
-        console.error("Device registration insert error:", { code: insertErr.code, message: insertErr.message });
-        return res.status(500).json({ error: "Registration failed." });
+        return res.status(500).json({ error: "Registration service unavailable. Please try again." });
+    } catch (rpcEx: any) {
+        console.error('[REGISTRATION ERROR] RPC exception caught:', rpcEx?.message || rpcEx);
+        return res.status(500).json({ error: "Registration service unavailable. Please try again." });
     }
-    
-    // Concurrency check
-    const { data: checkDls } = await supabaseAdmin.from('downloads')
-      .select('id')
-      .eq('order_id', orderId)
-      .order('downloaded_at', { ascending: true });
-      
-    if (checkDls && checkDls.length > 3) {
-        const allowedIds = checkDls.slice(0, 3).map(d => d.id);
-        if (!allowedIds.includes(deviceId)) {
-             await supabaseAdmin.from('downloads').delete().eq('id', deviceId).eq('order_id', orderId);
-             return res.status(400).json({ error: "Device limit reached. This document has already been registered on 3 devices." });
-        }
-    }
-    
-    console.log(`[ACCESS LOG] Order ${orderId} successfully registered to device ${deviceId}`);
-    
-    res.setHeader('Set-Cookie', `device_id=${deviceId}; HttpOnly; Path=/; Max-Age=315360000; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
-    return res.json({ success: true });
 });
 
 app.get("/api/document/stream/:token", async (req, res) => {
@@ -4195,13 +4284,8 @@ app.get("/api/document/stream/:token", async (req, res) => {
         return res.status(403).send("Device unauthorized. Please open the document through the secure link.");
     }
     
-    const { data: dls } = await supabaseAdmin.from('downloads')
-      .select('id')
-      .eq('order_id', orderId)
-      .order('downloaded_at', { ascending: true });
-      
-    const devices = dls || [];
-    const isRegistered = devices.some(d => d.id === deviceId);
+    const devices = await getOrderDownloads(orderId);
+    const isRegistered = isDeviceAuthorizedForOrder(devices, deviceId);
     
     if (!isRegistered) {
         console.warn(`[ACCESS LOG] Stream rejected for ${orderId}: Device mismatch.`);
@@ -4388,7 +4472,7 @@ app.get("/api/admin/document-access", requireAdmin, async (req, res) => {
     const orderIds = orders.map((o: any) => o.id);
     const { data: downloads } = await supabaseAdmin
       .from("downloads")
-      .select("id, order_id, downloaded_at")
+      .select("id, order_id, device_id, download_type, downloaded_at")
       .in("order_id", orderIds);
 
     const downloadsMap = new Map<string, any[]>();
@@ -4402,15 +4486,16 @@ app.get("/api/admin/document-access", requireAdmin, async (req, res) => {
 
     const { data: devReqs } = await supabaseAdmin
       .from("device_requests")
-      .select("order_id, status")
+      .select("id, order_id, status")
       .in("order_id", orderIds)
       .eq("status", "approved");
 
-    const approvedReqsMap = new Map<string, number>();
+    const approvedReqsMap = new Map<string, Set<string>>();
     if (devReqs) {
       devReqs.forEach((r: any) => {
-        const count = approvedReqsMap.get(r.order_id) || 0;
-        approvedReqsMap.set(r.order_id, count + 1);
+        const set = approvedReqsMap.get(r.order_id) || new Set<string>();
+        if (r.id) set.add(r.id);
+        approvedReqsMap.set(r.order_id, set);
       });
     }
 
@@ -4419,9 +4504,11 @@ app.get("/api/admin/document-access", requireAdmin, async (req, res) => {
 
     const accessList = orders.map((order: any) => {
       const dls = downloadsMap.get(order.id) || [];
-      const extraAllowed = approvedReqsMap.get(order.id) || 0;
-      const maxAllowed = 3 + extraAllowed;
-      const sortedDls = [...dls].sort((a, b) => new Date(b.downloaded_at || 0).getTime() - new Date(a.downloaded_at || 0).getTime());
+      const approvedCount = (approvedReqsMap.get(order.id) || new Set<string>()).size;
+      const maxAllowed = Math.min(3 + approvedCount, 5);
+      const devicesUsed = getDistinctDeviceCount(dls);
+      const browserDevices = dls.filter((d: any) => d.download_type !== 'direct_pdf' && (d.device_id || d.id));
+      const sortedDls = [...browserDevices].sort((a, b) => new Date(b.downloaded_at || 0).getTime() - new Date(a.downloaded_at || 0).getTime());
       const lastAccess = sortedDls.length > 0 ? sortedDls[0].downloaded_at : null;
       const token = generateAccessToken(order.id);
       const openDocumentUrl = getDocumentAccessUrl(req, token);
@@ -4440,11 +4527,11 @@ app.get("/api/admin/document-access", requireAdmin, async (req, res) => {
         mpesaReceipt: payment?.mpesa_receipt || 'PAID',
         activationStatus: order.status,
         documentAccessStatus: 'ACTIVE',
-        devicesUsed: dls.length,
+        devicesUsed,
         maxDevices: maxAllowed,
         lastAccessedAt: lastAccess,
         openDocumentUrl,
-        deviceDetails: dls.map((d: any) => ({ id: d.id, downloadedAt: d.downloaded_at }))
+        deviceDetails: browserDevices.map((d: any) => ({ id: d.device_id || d.id, downloadedAt: d.downloaded_at }))
       };
     });
 
@@ -4778,4 +4865,219 @@ export function areNamesMatching(
   }
 
   return targetFirst === userFirst && targetSecond === userSecond;
+}
+
+
+// Order Downloads & Persistent Device Tracking Helpers
+export interface OrderDownloadRecord {
+  id: string;
+  order_id?: string;
+  paper_id?: string;
+  device_id?: string | null;
+  download_type?: string | null;
+  downloaded_at?: string;
+}
+
+export async function getOrderDownloads(orderId: string): Promise<OrderDownloadRecord[]> {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('downloads')
+      .select('id, order_id, paper_id, device_id, download_type, downloaded_at')
+      .eq('order_id', orderId)
+      .order('downloaded_at', { ascending: true });
+
+    if (!error && data) {
+      return data;
+    }
+
+    // Fallback if device_id or download_type column has not yet been migrated in production (Postgres error 42703)
+    if (error && (error.code === '42703' || String(error.message || '').includes('device_id') || String(error.message || '').includes('download_type'))) {
+      const { data: fallbackData } = await supabaseAdmin
+        .from('downloads')
+        .select('id, order_id, paper_id, downloaded_at')
+        .eq('order_id', orderId)
+        .order('downloaded_at', { ascending: true });
+      return (fallbackData || []).map((d: any) => ({ ...d, device_id: null, download_type: null }));
+    }
+  } catch (e) {
+    console.warn(`[DEVICE_TRACKING] Error fetching downloads for order ${orderId}:`, e);
+  }
+  return [];
+}
+
+export function isDeviceAuthorizedForOrder(
+  devices: OrderDownloadRecord[],
+  targetDeviceId: string | null | undefined
+): boolean {
+  if (!targetDeviceId || !devices || devices.length === 0) return false;
+  return devices.some(d => {
+    // Direct PDF downloads or records without device_id never authorize a browser device
+    if (d.download_type === 'direct_pdf' || !d.device_id) return false;
+    return d.device_id === targetDeviceId;
+  });
+}
+
+export function getDistinctDeviceCount(devices: OrderDownloadRecord[]): number {
+  if (!devices || devices.length === 0) return 0;
+  const uniqueSet = new Set<string>();
+  devices.forEach(d => {
+    // Only count explicit, confirmed browser device registrations.
+    // Direct PDF downloads and un-reconciled NULL-device download logs do not consume seats.
+    // Matches SQL semantics: COUNT(DISTINCT device_id) ... WHERE device_id IS NOT NULL
+    if (d.device_id && d.device_id.trim() !== '') {
+      uniqueSet.add(d.device_id.trim());
+    }
+  });
+  return uniqueSet.size;
+}
+
+export interface MockOrderRecord {
+  id: string;
+  paper_id?: string | null;
+  status?: string | null;
+}
+
+export interface MockDeviceRequestRecord {
+  id: string;
+  order_id: string;
+  status: string;
+}
+
+export interface RpcRegistrationResult {
+  success: boolean;
+  status?: 'registered' | 'already_registered';
+  error?: string;
+  id?: string;
+  device_id?: string;
+  current_count?: number;
+  limit?: number;
+}
+
+/**
+ * Authoritative simulation helper mirroring the database-level register_document_device RPC.
+ * Used for automated verification and test coverage of the row-locked atomic transaction logic.
+ */
+export function simulateRegisterDocumentDevice(
+  orders: MockOrderRecord[],
+  downloads: OrderDownloadRecord[],
+  deviceRequests: MockDeviceRequestRecord[],
+  p_order_id: string,
+  p_paper_id: string | null | undefined,
+  p_device_id: string,
+  p_base_limit: number = 3,
+  p_strict_uuid: boolean = false
+): { result: RpcRegistrationResult; updatedDownloads: OrderDownloadRecord[] } {
+  const currentDownloads = [...downloads];
+
+  // 1. Input parameter validation
+  if (!p_order_id || !p_device_id || p_device_id.trim() === '') {
+    return {
+      result: { success: false, error: 'invalid_parameters' },
+      updatedDownloads: currentDownloads
+    };
+  }
+
+  // 1b. Defensive UUID validation
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (p_strict_uuid && !UUID_REGEX.test(p_device_id)) {
+    return {
+      result: { success: false, error: 'invalid_device_id' },
+      updatedDownloads: currentDownloads
+    };
+  }
+
+  // 2. Row-level lock & lookup on Orders table
+  const order = orders.find(o => o.id === p_order_id);
+  if (!order) {
+    return {
+      result: { success: false, error: 'order_not_found' },
+      updatedDownloads: currentDownloads
+    };
+  }
+
+  // Payment entitlement (covers both M-Pesa paid orders and FREE_ACCESS purchases where status = 'paid')
+  // Null-safe comparison ensures NULL status can never be treated as paid
+  if (order.status !== 'paid') {
+    return {
+      result: { success: false, error: 'order_not_paid' },
+      updatedDownloads: currentDownloads
+    };
+  }
+
+  // 3. Authoritative paper entitlement check
+  // Null-safe comparison prevents non-null requested paper from bypassing validation when order paper_id is NULL,
+  // while preserving legitimate orders where both paper IDs are NULL.
+  const requestedPaper = p_paper_id ?? null;
+  const orderPaper = order.paper_id ?? null;
+  if (requestedPaper !== orderPaper) {
+    return {
+      result: { success: false, error: 'paper_mismatch' },
+      updatedDownloads: currentDownloads
+    };
+  }
+
+  // 4. Idempotent check: Is this device already registered for this order?
+  // 4a. Check explicit device_id
+  const alreadyRegistered = currentDownloads.find(d => 
+    d.order_id === p_order_id && d.device_id === p_device_id
+  );
+  if (alreadyRegistered) {
+    return {
+      result: {
+        success: true,
+        status: 'already_registered',
+        device_id: p_device_id
+      },
+      updatedDownloads: currentDownloads
+    };
+  }
+
+
+
+  // 5. Compute effective limit (base limit + distinct approved device exception requests)
+  // Hard-capped at 5 total devices maximum
+  const approvedReqs = deviceRequests.filter(r => r.order_id === p_order_id && r.status === 'approved');
+  const approvedExtra = new Set(approvedReqs.map(r => r.id)).size;
+  const effectiveLimit = Math.min(p_base_limit + approvedExtra, 5);
+
+  // 6. Count currently registered distinct devices for this order (excludes direct PDF downloads)
+  const orderDownloads = currentDownloads.filter(d => d.order_id === p_order_id);
+  const distinctCount = getDistinctDeviceCount(orderDownloads);
+
+  if (distinctCount >= effectiveLimit) {
+    return {
+      result: {
+        success: false,
+        error: 'device_limit_reached',
+        limit: effectiveLimit,
+        current_count: distinctCount
+      },
+      updatedDownloads: currentDownloads
+    };
+  }
+
+  // 7. Atomic insert using authoritative order.paper_id and independent surrogate UUID primary key
+  // downloads.id is kept strictly decoupled from client device cookies, preventing primary key collisions
+  const newRowId = crypto.randomUUID();
+  const newRow: OrderDownloadRecord = {
+    id: newRowId,
+    order_id: p_order_id,
+    paper_id: order.paper_id,
+    device_id: p_device_id,
+    download_type: 'browser_device',
+    downloaded_at: new Date().toISOString()
+  };
+  currentDownloads.push(newRow);
+
+  return {
+    result: {
+      success: true,
+      status: 'registered',
+      id: newRowId,
+      device_id: p_device_id,
+      current_count: distinctCount + 1,
+      limit: effectiveLimit
+    },
+    updatedDownloads: currentDownloads
+  };
 }
