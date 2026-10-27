@@ -1,7 +1,22 @@
-import React, { useState, useEffect } from 'react';
-import { X, FileText, Download, CheckCircle2, RotateCw, ExternalLink, Loader2, AlertTriangle } from 'lucide-react';
-import { PDFDocument } from 'pdf-lib';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { 
+  X, 
+  FileText, 
+  Download, 
+  CheckCircle2, 
+  RotateCw, 
+  Loader2, 
+  AlertTriangle,
+  ChevronLeft,
+  ChevronRight,
+  ZoomIn,
+  ZoomOut,
+  Maximize2
+} from 'lucide-react';
+import * as pdfjsLib from 'pdfjs-dist';
 import { Paper } from './adminTypes';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
 interface AdminPaperViewerModalProps {
   paper: Paper | null;
@@ -14,33 +29,64 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
   onClose,
   onRequestDownload,
 }) => {
-  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [pdfDoc, setPdfDoc] = useState<any>(null);
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [totalPages, setTotalPages] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [totalPages, setTotalPages] = useState<number>(0);
   const [reloadTrigger, setReloadTrigger] = useState<number>(0);
 
+  const [zoomMultiplier, setZoomMultiplier] = useState<number>(1.0);
+  const [baseFitScale, setBaseFitScale] = useState<number>(1.0);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const renderTaskRef = useRef<any>(null);
+  const unscaledDimRef = useRef<{ width: number; height: number } | null>(null);
+
+  const updateFitScale = useCallback(() => {
+    if (!containerRef.current || !unscaledDimRef.current) return;
+    const container = containerRef.current;
+    const availW = Math.max(container.clientWidth - 40, 200);
+    const availH = Math.max(container.clientHeight - 40, 200);
+    const { width, height } = unscaledDimRef.current;
+    if (width > 0 && height > 0) {
+      setBaseFitScale(Math.min(availW / width, availH / height));
+    }
+  }, []);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const observer = new ResizeObserver(() => updateFitScale());
+    observer.observe(container);
+    window.addEventListener('resize', updateFitScale);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updateFitScale);
+    };
+  }, [updateFitScale]);
+
+  const effectiveScale = (baseFitScale || 1.0) * zoomMultiplier;
+
+  // Load PDF ArrayBuffer
   useEffect(() => {
     if (!paper) {
-      setPdfUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return null;
-      });
+      setPdfDoc(null);
       setTotalPages(0);
       return;
     }
 
     let isMounted = true;
-    let createdBlobUrl: string | null = null;
 
     async function loadPdf() {
       setIsLoading(true);
       setError(null);
+      setCurrentPage(1);
 
       try {
         let arrayBuffer: ArrayBuffer;
 
-        // Check if there is a local file object (e.g., when previewing draft or selected file before save)
         if (paper.localFile && paper.localFile instanceof File) {
           arrayBuffer = await paper.localFile.arrayBuffer();
         } else if (!paper.id || paper.id === 'DRAFT' || paper.id.startsWith('paper-')) {
@@ -48,7 +94,6 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
           setError('No document file attached to preview. Please select a PDF document or save the paper first.');
           return;
         } else {
-          // Authoritative Server-side preview from Supabase private storage
           const token = localStorage.getItem('admin_token');
           const res = await fetch(`/api/admin/papers/${paper.id}/preview?t=${Date.now()}`, {
             headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -63,32 +108,13 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
           arrayBuffer = await res.arrayBuffer();
         }
 
-        // Inspect actual PDF page count using pdf-lib
-        try {
-          const pdfDoc = await PDFDocument.load(arrayBuffer);
-          const count = pdfDoc.getPageCount();
-          if (isMounted) {
-            setTotalPages(count);
-          }
-        } catch (pageInspectionErr) {
-          console.warn('Notice: PDF page count inspection warning:', pageInspectionErr);
-          if (isMounted) {
-            setTotalPages(1);
-          }
-        }
-
-        const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
-        const blobUrl = URL.createObjectURL(blob);
-        createdBlobUrl = blobUrl;
+        const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+        const doc = await loadingTask.promise;
 
         if (isMounted) {
-          setPdfUrl((prev) => {
-            if (prev) URL.revokeObjectURL(prev);
-            return blobUrl;
-          });
+          setPdfDoc(doc);
+          setTotalPages(doc.numPages);
           setIsLoading(false);
-        } else {
-          URL.revokeObjectURL(blobUrl);
         }
       } catch (err: any) {
         if (isMounted) {
@@ -103,11 +129,51 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
 
     return () => {
       isMounted = false;
-      if (createdBlobUrl) {
-        URL.revokeObjectURL(createdBlobUrl);
-      }
     };
   }, [paper?.id, paper?.file_path, reloadTrigger]);
+
+  // Render single page onto canvas
+  useEffect(() => {
+    if (!pdfDoc || !canvasRef.current) return;
+
+    let isCancelled = false;
+    if (renderTaskRef.current) {
+      renderTaskRef.current.cancel();
+    }
+
+    pdfDoc.getPage(currentPage).then((page: any) => {
+      if (isCancelled) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      const unscaledViewport = page.getViewport({ scale: 1.0 });
+      unscaledDimRef.current = { width: unscaledViewport.width, height: unscaledViewport.height };
+      updateFitScale();
+
+      const viewport = page.getViewport({ scale: effectiveScale });
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+
+      const renderContext = {
+        canvasContext: context,
+        viewport: viewport,
+      };
+
+      const renderTask = page.render(renderContext);
+      renderTaskRef.current = renderTask;
+      renderTask.promise.catch((err: any) => {
+        if (err?.name !== 'RenderingCancelledException') {
+          console.error('Page render error:', err);
+        }
+      });
+    });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [pdfDoc, currentPage, effectiveScale, updateFitScale]);
 
   if (!paper) return null;
 
@@ -145,7 +211,7 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
             <button
               type="button"
               onClick={() => setReloadTrigger((prev) => prev + 1)}
-              className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors"
+              className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors cursor-pointer"
               title="Refresh Preview from Storage"
             >
               <RotateCw className="w-4 h-4" />
@@ -153,7 +219,7 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
             <button
               type="button"
               onClick={() => onRequestDownload(paper)}
-              className="hidden sm:flex px-3.5 py-2 bg-[#00D26A] hover:bg-[#00b85c] text-slate-950 font-black text-xs rounded-xl items-center gap-1.5 shadow transition-all"
+              className="hidden sm:flex px-3.5 py-2 bg-[#00D26A] hover:bg-[#00b85c] text-slate-950 font-black text-xs rounded-xl items-center gap-1.5 shadow transition-all cursor-pointer"
             >
               <Download className="w-4 h-4" />
               <span>Download PDF</span>
@@ -161,33 +227,91 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
             <button
               type="button"
               onClick={onClose}
-              className="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center transition-colors"
+              className="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center transition-colors cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
           </div>
         </div>
 
-        {/* Page Toolbar */}
-        <div className="px-6 py-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between text-xs text-slate-300 shrink-0">
+        {/* Page Toolbar with Pure Canvas Controls (No Native Plugin, No Facing/Two-Page Mode) */}
+        <div className="px-6 py-2.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-300 shrink-0">
           <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1.5 bg-slate-800 px-3 py-1 rounded-lg border border-slate-700 font-mono font-bold text-slate-200">
-              <span>Document Length:</span>
-              <span className="text-[#00D26A] text-sm">
-                {totalPages > 0 ? `${totalPages} ${totalPages === 1 ? 'Page' : 'Pages'}` : '—'}
-              </span>
-            </div>
-            {pdfUrl && (
-              <a
-                href={pdfUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="hidden md:inline-flex items-center gap-1 text-[11px] text-sky-400 hover:text-sky-300 transition-colors font-medium"
+            {/* Page Navigation */}
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                disabled={currentPage <= 1 || isLoading}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors cursor-pointer flex items-center gap-1 text-xs"
+                title="Previous Page"
               >
-                <ExternalLink className="w-3.5 h-3.5" />
-                <span>Open in Tab</span>
-              </a>
-            )}
+                <ChevronLeft className="w-4 h-4" />
+                <span className="hidden sm:inline">Prev</span>
+              </button>
+
+              <div className="flex items-center gap-1.5 font-mono">
+                <span>Page</span>
+                <select
+                  value={currentPage}
+                  onChange={(e) => setCurrentPage(Number(e.target.value))}
+                  disabled={isLoading || totalPages <= 1}
+                  className="bg-slate-800 text-white text-xs rounded-lg px-2 py-1 border border-slate-700 disabled:opacity-50 outline-none focus:border-[#00D26A]"
+                >
+                  {Array.from({ length: totalPages || 1 }, (_, i) => i + 1).map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-slate-400">of {totalPages || 1}</span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                disabled={currentPage >= totalPages || isLoading}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors cursor-pointer flex items-center gap-1 text-xs"
+                title="Next Page"
+              >
+                <span className="hidden sm:inline">Next</span>
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Zoom Controls */}
+            <div className="flex items-center gap-1 bg-slate-800 rounded-lg p-1">
+              <button
+                type="button"
+                onClick={() => setZoomMultiplier(1.0)}
+                className={`px-2 py-0.5 rounded text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1 ${
+                  zoomMultiplier === 1.0 ? 'bg-[#00D26A] text-slate-950 font-bold' : 'text-slate-300 hover:bg-slate-700'
+                }`}
+                title="Fit Page within Viewport"
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+                <span>Fit</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setZoomMultiplier((z) => Math.max(+(z - 0.25).toFixed(2), 0.5))}
+                className="p-1 rounded hover:bg-slate-700 text-slate-300 transition-colors cursor-pointer"
+                title="Zoom Out"
+              >
+                <ZoomOut className="w-4 h-4" />
+              </button>
+              <span className="text-xs font-mono text-slate-300 w-12 text-center">
+                {zoomMultiplier === 1.0 ? 'Fit' : `${Math.round(zoomMultiplier * 100)}%`}
+              </span>
+              <button
+                type="button"
+                onClick={() => setZoomMultiplier((z) => Math.min(+(z + 0.25).toFixed(2), 3.0))}
+                className="p-1 rounded hover:bg-slate-700 text-slate-300 transition-colors cursor-pointer"
+                title="Zoom In"
+              >
+                <ZoomIn className="w-4 h-4" />
+              </button>
+            </div>
           </div>
 
           <div className="flex items-center gap-3 font-mono text-[11px] text-slate-400">
@@ -204,7 +328,7 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
             ) : (
               <span className="flex items-center gap-1 text-emerald-400 font-bold">
                 <CheckCircle2 className="w-3.5 h-3.5 text-[#00D26A]" />
-                <span>Live Repository PDF ({totalPages} {totalPages === 1 ? 'Page' : 'Pages'})</span>
+                <span>Single-Page Canvas Preview ({totalPages} {totalPages === 1 ? 'Page' : 'Pages'})</span>
               </span>
             )}
             <span className="hidden sm:inline">•</span>
@@ -212,8 +336,12 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
           </div>
         </div>
 
-        {/* Document Rendering */}
-        <div className="flex-1 bg-slate-950 p-3 sm:p-6 overflow-hidden flex flex-col justify-center items-center relative">
+        {/* Document Rendering via Pure Single-Page HTML5 Canvas */}
+        <div 
+          ref={containerRef}
+          className="flex-1 bg-slate-950 p-3 sm:p-6 overflow-auto flex flex-col justify-center items-center relative select-none"
+          onContextMenu={(e) => e.preventDefault()}
+        >
           {isLoading && (
             <div className="flex flex-col items-center justify-center gap-3 text-slate-400">
               <Loader2 className="w-8 h-8 text-[#00D26A] animate-spin" />
@@ -229,7 +357,7 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
               <button
                 type="button"
                 onClick={() => setReloadTrigger((prev) => prev + 1)}
-                className="px-4 py-2 bg-rose-700 hover:bg-rose-600 text-white text-xs font-bold rounded-xl transition-colors inline-flex items-center gap-1.5"
+                className="px-4 py-2 bg-rose-700 hover:bg-rose-600 text-white text-xs font-bold rounded-xl transition-colors inline-flex items-center gap-1.5 cursor-pointer"
               >
                 <RotateCw className="w-3.5 h-3.5" />
                 <span>Retry Fetch</span>
@@ -237,20 +365,10 @@ export const AdminPaperViewerModal: React.FC<AdminPaperViewerModalProps> = ({
             </div>
           )}
 
-          {!isLoading && !error && pdfUrl && (
-            <object
-              data={`${pdfUrl}#toolbar=1&navpanes=0`}
-              type="application/pdf"
-              className="w-full h-full bg-slate-900 rounded-2xl border border-slate-800 shadow-2xl"
-              title={`Preview: ${paper.unit_code} - ${paper.paper_title}`}
-            >
-              <iframe
-                id="admin-pdf-preview-frame"
-                src={`${pdfUrl}#toolbar=1&navpanes=0`}
-                className="w-full h-full bg-slate-900 rounded-2xl border border-slate-800"
-                title={`Preview: ${paper.unit_code} - ${paper.paper_title}`}
-              />
-            </object>
+          {!isLoading && !error && (
+            <div className="shadow-2xl bg-white rounded-lg overflow-hidden border border-slate-700 relative">
+              <canvas ref={canvasRef} className="block shadow-lg" />
+            </div>
           )}
         </div>
       </div>

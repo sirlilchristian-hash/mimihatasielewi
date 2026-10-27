@@ -4270,7 +4270,608 @@ app.post("/api/document/register-device", async (req, res) => {
     }
 });
 
+// Viewing Session & Per-Page Reading Management Constants
+export const OVERALL_VIEWING_SESSION_DURATION_MS = 10 * 60 * 1000; // 600,000 ms (10 minutes)
+export const OVERALL_VIEWING_SESSION_DURATION_SECONDS = 600;
+
+export const NEW_PAGE_READING_DURATION_MS = 2 * 60 * 1000; // 120,000 ms (2 minutes)
+export const NEW_PAGE_READING_DURATION_SECONDS = 120;
+
+export const REVISIT_PAGE_TRANSITION_DURATION_MS = 60 * 1000; // 60,000 ms (1 minute)
+export const REVISIT_PAGE_TRANSITION_DURATION_SECONDS = 60;
+
+export interface PageReadingTimer {
+  firstOpenedAt: number;
+  readingExpiresAt: number;
+  isCompleted: boolean;
+  hasArrived?: boolean;
+}
+
+export interface NavigationTransition {
+  destinationPage: number;
+  startedAt: number;
+  expiresAt: number;
+}
+
+export interface ViewingSessionData {
+  orderId: string;
+  deviceId: string;
+  overallExpiresAt: number;
+  expiresAt: number; // alias for overallExpiresAt for backwards compatibility
+  currentPage: number;
+  visitedPages: number[];
+  pageReadingTimers: Record<number, PageReadingTimer>;
+  activeTransition: NavigationTransition | null;
+}
+
+export const activeViewingSessions = new Map<string, ViewingSessionData>();
+
+export function checkOrCreateViewingSession(orderId: string, deviceId: string, now: number = Date.now()): { 
+  valid: boolean; 
+  remainingSeconds: number;
+  session?: ViewingSessionData | null;
+} {
+  const sessionKey = `${orderId}:${deviceId}`;
+  const existing = activeViewingSessions.get(sessionKey);
+  
+  if (existing) {
+    const overallExpiry = Math.min(
+      existing.overallExpiresAt ?? Infinity,
+      existing.expiresAt ?? Infinity
+    );
+    if (now > overallExpiry) {
+      activeViewingSessions.delete(sessionKey);
+      return { valid: false, remainingSeconds: 0, session: null };
+    }
+    const curTimer = existing.pageReadingTimers[existing.currentPage];
+    if (curTimer && !curTimer.isCompleted && now >= curTimer.readingExpiresAt) {
+      curTimer.isCompleted = true;
+    }
+    const remainingSeconds = Math.max(0, Math.floor((overallExpiry - now) / 1000));
+    return { valid: true, remainingSeconds, session: existing };
+  } else {
+    const overallExpiresAt = now + OVERALL_VIEWING_SESSION_DURATION_MS; // 10 minutes TTL
+    const newSession: ViewingSessionData = {
+      orderId,
+      deviceId,
+      overallExpiresAt,
+      expiresAt: overallExpiresAt,
+      currentPage: 1,
+      visitedPages: [1],
+      pageReadingTimers: {
+        1: {
+          firstOpenedAt: now,
+          readingExpiresAt: now, // Welcome page is free: no countdown required
+          isCompleted: true,
+          hasArrived: true
+        }
+      },
+      activeTransition: null
+    };
+    activeViewingSessions.set(sessionKey, newSession);
+    return { valid: true, remainingSeconds: OVERALL_VIEWING_SESSION_DURATION_SECONDS, session: newSession };
+  }
+}
+
+export function requestSessionNavigation(
+  orderId: string, 
+  deviceId: string, 
+  targetPage: number,
+  now: number = Date.now()
+): {
+  success: boolean;
+  navigated?: boolean;
+  transitioning?: boolean;
+  destinationPage?: number;
+  currentPage?: number;
+  remainingSeconds?: number;
+  expiresAt?: number;
+  waitingArrival?: boolean;
+  error?: string;
+  message?: string;
+} {
+  const check = checkOrCreateViewingSession(orderId, deviceId, now);
+  if (!check.valid || !check.session) {
+    return { success: false, error: 'session_expired', message: 'Viewing session expired.' };
+  }
+  const session = check.session;
+
+  if (!Number.isInteger(targetPage) || targetPage < 1) {
+    return { success: false, error: 'invalid_page', message: 'Invalid page requested.' };
+  }
+
+  if (targetPage === session.currentPage) {
+    return { success: true, navigated: true, currentPage: targetPage };
+  }
+
+  // 1. Check if current page reading timer is active
+  const curTimer = session.pageReadingTimers[session.currentPage];
+  if (curTimer && !curTimer.isCompleted && now < curTimer.readingExpiresAt) {
+    const remaining = Math.ceil((curTimer.readingExpiresAt - now) / 1000);
+    return {
+      success: false,
+      error: 'page_reading_active',
+      message: `Current page reading countdown is active (${remaining}s remaining). Page navigation is locked.`,
+      remainingSeconds: remaining
+    };
+  }
+
+  // 2. Check if a 1-minute transition is active
+  if (session.activeTransition) {
+    if (session.activeTransition.destinationPage !== targetPage) {
+      const remaining = Math.max(0, Math.ceil((session.activeTransition.expiresAt - now) / 1000));
+      return {
+        success: false,
+        error: 'transition_in_progress',
+        message: `A navigation transition to Page ${session.activeTransition.destinationPage} is currently active.`,
+        destinationPage: session.activeTransition.destinationPage,
+        remainingSeconds: remaining
+      };
+    }
+    if (now >= session.activeTransition.expiresAt) {
+      session.currentPage = targetPage;
+      session.activeTransition = null;
+      return { success: true, navigated: true, currentPage: targetPage };
+    } else {
+      const remaining = Math.ceil((session.activeTransition.expiresAt - now) / 1000);
+      return {
+        success: true,
+        transitioning: true,
+        destinationPage: targetPage,
+        remainingSeconds: remaining,
+        expiresAt: session.activeTransition.expiresAt
+      };
+    }
+  }
+
+  // 3. Revisiting a previously visited page -> start 1-minute transition gate
+  if (session.visitedPages.includes(targetPage)) {
+    session.activeTransition = {
+      destinationPage: targetPage,
+      startedAt: now,
+      expiresAt: now + REVISIT_PAGE_TRANSITION_DURATION_MS
+    };
+    return {
+      success: true,
+      transitioning: true,
+      destinationPage: targetPage,
+      remainingSeconds: REVISIT_PAGE_TRANSITION_DURATION_SECONDS,
+      expiresAt: session.activeTransition.expiresAt
+    };
+  }
+
+  // 4. Navigating to a new, unvisited page -> open immediately with pending arrival
+  session.currentPage = targetPage;
+  session.visitedPages.push(targetPage);
+  const readingExpiresAt = now + NEW_PAGE_READING_DURATION_MS;
+  session.pageReadingTimers[targetPage] = {
+    firstOpenedAt: now,
+    readingExpiresAt,
+    isCompleted: false,
+    hasArrived: false
+  };
+  session.activeTransition = null;
+
+  return {
+    success: true,
+    navigated: true,
+    currentPage: targetPage,
+    remainingSeconds: NEW_PAGE_READING_DURATION_SECONDS,
+    expiresAt: readingExpiresAt,
+    waitingArrival: true
+  };
+}
+
+export function recordPageArrival(
+  orderId: string, 
+  deviceId: string, 
+  targetPage: number, 
+  now: number = Date.now()
+): {
+  success: boolean;
+  arrived: boolean;
+  currentPage: number;
+  remainingSeconds: number;
+  expiresAt: number;
+  isFirstArrival: boolean;
+  error?: string;
+  message?: string;
+} {
+  const check = checkOrCreateViewingSession(orderId, deviceId, now);
+  if (!check.valid || !check.session) {
+    return { 
+      success: false, 
+      arrived: false, 
+      currentPage: targetPage, 
+      remainingSeconds: 0, 
+      expiresAt: 0, 
+      isFirstArrival: false, 
+      error: 'session_expired', 
+      message: 'Viewing session expired.' 
+    };
+  }
+  const session = check.session;
+
+  if (targetPage !== session.currentPage) {
+    return { 
+      success: false, 
+      arrived: false, 
+      currentPage: session.currentPage, 
+      remainingSeconds: 0, 
+      expiresAt: 0, 
+      isFirstArrival: false, 
+      error: 'page_mismatch', 
+      message: 'Requested arrival page does not match current active page.' 
+    };
+  }
+
+  // Welcome page 1 is free: already arrived and completed
+  if (targetPage === 1) {
+    return {
+      success: true,
+      arrived: true,
+      currentPage: 1,
+      remainingSeconds: 0,
+      expiresAt: now,
+      isFirstArrival: false
+    };
+  }
+
+  let timer = session.pageReadingTimers[targetPage];
+  if (!timer) {
+    timer = {
+      firstOpenedAt: now,
+      readingExpiresAt: now + NEW_PAGE_READING_DURATION_MS,
+      isCompleted: false,
+      hasArrived: false
+    };
+    session.pageReadingTimers[targetPage] = timer;
+  }
+
+  // If already arrived (or reading completed), DO NOT restart or reset the timer!
+  // Ensures ordinary rendering, zooming, scrolling within the current page, tab visibility changes, or network reconnection never reset the timer.
+  if (timer.hasArrived) {
+    const rem = timer.isCompleted ? 0 : Math.max(0, Math.ceil((timer.readingExpiresAt - now) / 1000));
+    return {
+      success: true,
+      arrived: true,
+      currentPage: targetPage,
+      remainingSeconds: rem,
+      expiresAt: timer.readingExpiresAt,
+      isFirstArrival: false
+    };
+  }
+
+  // First arrival event: Page has actually opened and landed in the viewer!
+  // Start the authoritative 120-second reading lock now.
+  timer.hasArrived = true;
+  timer.firstOpenedAt = now;
+  timer.readingExpiresAt = now + NEW_PAGE_READING_DURATION_MS;
+  timer.isCompleted = false;
+
+  return {
+    success: true,
+    arrived: true,
+    currentPage: targetPage,
+    remainingSeconds: NEW_PAGE_READING_DURATION_SECONDS,
+    expiresAt: timer.readingExpiresAt,
+    isFirstArrival: true
+  };
+}
+
+export function completeSessionTransition(
+  orderId: string, 
+  deviceId: string,
+  now: number = Date.now()
+): {
+  success: boolean;
+  navigated?: boolean;
+  currentPage?: number;
+  error?: string;
+  message?: string;
+  remainingSeconds?: number;
+} {
+  const check = checkOrCreateViewingSession(orderId, deviceId, now);
+  if (!check.valid || !check.session) {
+    return { success: false, error: 'session_expired', message: 'Viewing session expired.' };
+  }
+  const session = check.session;
+
+  if (!session.activeTransition) {
+    return { success: false, error: 'no_active_transition', message: 'No active transition found.' };
+  }
+
+  if (now < session.activeTransition.expiresAt) {
+    const remaining = Math.ceil((session.activeTransition.expiresAt - now) / 1000);
+    return {
+      success: false,
+      error: 'transition_not_completed',
+      message: `Transition countdown is still active (${remaining}s remaining).`,
+      remainingSeconds: remaining
+    };
+  }
+
+  const dest = session.activeTransition.destinationPage;
+  session.currentPage = dest;
+  session.activeTransition = null;
+
+  return {
+    success: true,
+    navigated: true,
+    currentPage: dest
+  };
+}
+
+export function authorizeDirectPageAccess(
+  session: ViewingSessionData,
+  targetPage: number,
+  now: number = Date.now()
+): { allowed: boolean; reason?: string } {
+  const overallExpiry = Math.min(
+    session.overallExpiresAt ?? Infinity,
+    session.expiresAt ?? Infinity
+  );
+  if (now > overallExpiry) {
+    return { allowed: false, reason: 'session_expired' };
+  }
+
+  if (targetPage === session.currentPage) {
+    return { allowed: true };
+  }
+
+  // 1. Current page reading timer active
+  const curTimer = session.pageReadingTimers[session.currentPage];
+  if (curTimer && !curTimer.isCompleted && now < curTimer.readingExpiresAt) {
+    return { allowed: false, reason: 'current_page_reading_active' };
+  }
+
+  // 2. 1-minute transition gate active
+  if (session.activeTransition) {
+    if (session.activeTransition.destinationPage !== targetPage || now < session.activeTransition.expiresAt) {
+      return { allowed: false, reason: 'transition_in_progress' };
+    }
+    // Completed transition authorizes destination page
+    session.currentPage = targetPage;
+    session.activeTransition = null;
+    return { allowed: true };
+  }
+
+  // 3. Unauthorized direct jump without navigation request
+  if (session.visitedPages.includes(targetPage)) {
+    return { allowed: false, reason: 'transition_gate_required' };
+  }
+  return { allowed: false, reason: 'navigation_request_required' };
+}
+
+app.get("/api/document/session/:token", async (req, res) => {
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    const { token } = req.params;
+    const orderId = verifyAccessToken(token);
+    if (!orderId) return res.status(403).json({ error: "Invalid token" });
+
+    const cookies = req.headers.cookie || '';
+    const match = cookies.match(/(?:^|; )device_id=([^;]*)/);
+    const deviceId = match ? match[1] : null;
+    if (!deviceId) return res.status(403).json({ error: "Device unauthorized" });
+
+    const sessionCheck = checkOrCreateViewingSession(orderId, deviceId);
+    if (!sessionCheck.valid || !sessionCheck.session) {
+        return res.status(403).json({ error: "Viewing session expired (10-minute limit reached)." });
+    }
+
+    const session = sessionCheck.session;
+    const now = Date.now();
+    const curTimer = session.pageReadingTimers[session.currentPage];
+    const pageRemainingSeconds = curTimer && !curTimer.isCompleted 
+        ? Math.max(0, Math.ceil((curTimer.readingExpiresAt - now) / 1000)) 
+        : 0;
+
+    const transitionRemainingSeconds = session.activeTransition 
+        ? Math.max(0, Math.ceil((session.activeTransition.expiresAt - now) / 1000))
+        : 0;
+
+    return res.json({ 
+        success: true, 
+        overallRemainingSeconds: sessionCheck.remainingSeconds, 
+        remainingSeconds: sessionCheck.remainingSeconds,
+        overallExpiresAt: session.overallExpiresAt,
+        expiresAt: session.overallExpiresAt,
+        currentPage: session.currentPage,
+        visitedPages: session.visitedPages,
+        pageTimer: {
+            currentPage: session.currentPage,
+            isCompleted: Boolean(curTimer?.isCompleted || now >= (curTimer?.readingExpiresAt || 0)),
+            remainingSeconds: pageRemainingSeconds,
+            readingExpiresAt: curTimer?.readingExpiresAt || 0
+        },
+        activeTransition: session.activeTransition ? {
+            destinationPage: session.activeTransition.destinationPage,
+            remainingSeconds: transitionRemainingSeconds,
+            expiresAt: session.activeTransition.expiresAt,
+            canComplete: now >= session.activeTransition.expiresAt
+        } : null
+    });
+});
+
+app.post("/api/document/session/:token/navigate", async (req, res) => {
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    const { token } = req.params;
+    const { targetPage } = req.body || {};
+    const orderId = verifyAccessToken(token);
+    if (!orderId) return res.status(403).json({ error: "Invalid token" });
+
+    const cookies = req.headers.cookie || '';
+    const match = cookies.match(/(?:^|; )device_id=([^;]*)/);
+    const deviceId = match ? match[1] : null;
+    if (!deviceId) return res.status(403).json({ error: "Device unauthorized" });
+
+    const pageNum = parseInt(targetPage, 10);
+    if (isNaN(pageNum) || pageNum < 1) {
+        return res.status(400).json({ success: false, error: "invalid_page", message: "Invalid page number" });
+    }
+
+    const result = requestSessionNavigation(orderId, deviceId, pageNum);
+    if (!result.success) {
+        return res.status(400).json(result);
+    }
+    return res.json(result);
+});
+
+app.post("/api/document/session/:token/complete-transition", async (req, res) => {
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    const { token } = req.params;
+    const orderId = verifyAccessToken(token);
+    if (!orderId) return res.status(403).json({ error: "Invalid token" });
+
+    const cookies = req.headers.cookie || '';
+    const match = cookies.match(/(?:^|; )device_id=([^;]*)/);
+    const deviceId = match ? match[1] : null;
+    if (!deviceId) return res.status(403).json({ error: "Device unauthorized" });
+
+    const result = completeSessionTransition(orderId, deviceId);
+    if (!result.success) {
+        return res.status(400).json(result);
+    }
+    return res.json(result);
+});
+
+app.post("/api/document/session/:token/arrive", async (req, res) => {
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    const { token } = req.params;
+    const { page } = req.body || {};
+    const orderId = verifyAccessToken(token);
+    if (!orderId) return res.status(403).json({ error: "Invalid token" });
+
+    const cookies = req.headers.cookie || '';
+    const match = cookies.match(/(?:^|; )device_id=([^;]*)/);
+    const deviceId = match ? match[1] : null;
+    if (!deviceId) return res.status(403).json({ error: "Device unauthorized" });
+
+    const pageNum = parseInt(page, 10);
+    if (isNaN(pageNum) || pageNum < 1) {
+        return res.status(400).json({ success: false, error: "invalid_page", message: "Invalid page number" });
+    }
+
+    const result = recordPageArrival(orderId, deviceId, pageNum);
+    if (!result.success) {
+        return res.status(400).json(result);
+    }
+    return res.json(result);
+});
+
+app.get("/api/document/page/:token/:pageNum", async (req, res) => {
+    // Security Gate: Reject direct address-bar navigation that exposes raw page PDF to Chrome's native PDF plugin
+    if (req.headers['sec-fetch-dest'] === 'document' || req.headers['sec-fetch-mode'] === 'navigate') {
+        return res.status(403).send("Direct browser navigation to raw document page is prohibited. Please view the document through the secure viewer.");
+    }
+
+    const { token, pageNum } = req.params;
+    const targetPage = parseInt(pageNum, 10);
+    if (isNaN(targetPage) || targetPage < 1) {
+        return res.status(400).send("Invalid page number");
+    }
+
+    const orderId = verifyAccessToken(token);
+    if (!orderId) return res.status(403).send("Invalid token");
+
+    const cookies = req.headers.cookie || '';
+    const match = cookies.match(/(?:^|; )device_id=([^;]*)/);
+    const deviceId = match ? match[1] : null;
+    if (!deviceId) return res.status(403).send("Device unauthorized");
+
+    const devices = await getOrderDownloads(orderId);
+    if (!isDeviceAuthorizedForOrder(devices, deviceId)) {
+        return res.status(403).send("Device unauthorized");
+    }
+
+    const sessionCheck = checkOrCreateViewingSession(orderId, deviceId);
+    if (!sessionCheck.valid || !sessionCheck.session) {
+        return res.status(403).send("Viewing session expired (10-minute limit reached).");
+    }
+
+    const authCheck = authorizeDirectPageAccess(sessionCheck.session, targetPage);
+    if (!authCheck.allowed) {
+        console.warn(`[DIRECT PAGE BLOCKED] Order ${orderId}, Device ${deviceId}, Page ${targetPage}: ${authCheck.reason}`);
+        if (authCheck.reason === 'session_expired') {
+            return res.status(403).send("Viewing session expired (10-minute limit reached).");
+        }
+        if (authCheck.reason === 'current_page_reading_active') {
+            return res.status(403).send("Page access blocked: Current page reading countdown is active.");
+        }
+        if (authCheck.reason === 'transition_in_progress') {
+            return res.status(403).send("Page access blocked: 1-minute navigation gate in progress.");
+        }
+        if (authCheck.reason === 'transition_gate_required') {
+            return res.status(403).send("Page access blocked: 1-minute navigation gate required for previously visited page.");
+        }
+        return res.status(403).send("Page access blocked: Navigation request required.");
+    }
+
+    const { data: order, error: orderErr } = await supabaseAdmin
+      .from('Orders')
+      .select('id, paper_id, status, purchased_pages, page_quantity')
+      .eq('id', orderId)
+      .maybeSingle();
+
+    if (orderErr || !order || order.status !== 'paid') {
+        return res.status(403).send("Access denied. Order is not active or awaiting payment confirmation.");
+    }
+
+    const { data: paper, error: paperErr } = await supabaseAdmin
+      .from('Papers')
+      .select('id, file_path, unit_code, paper_title, total_pages')
+      .eq('id', order.paper_id)
+      .maybeSingle();
+
+    if (paperErr || !paper || !paper.file_path) {
+        return res.status(404).send("File not found");
+    }
+
+    try {
+        const { restrictedPdfBytes, pageCount } = await getAuthoritativeRestrictedPdf({
+            orderId,
+            order,
+            paper,
+        });
+
+        if (targetPage > pageCount) {
+            return res.status(404).send(`Page ${targetPage} out of bounds for document with ${pageCount} pages.`);
+        }
+
+        const singlePageBytes = await generatePageSpecificPDF(restrictedPdfBytes, [targetPage]);
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="page_${targetPage}.pdf"`);
+        res.setHeader('Content-Length', singlePageBytes.length);
+        res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+
+        return res.end(Buffer.from(singlePageBytes));
+    } catch (err: any) {
+        console.error(`[PAGE STREAM ERROR] Error serving page ${targetPage} for order ${orderId}:`, err);
+        return res.status(500).send("Failed to extract page.");
+    }
+});
+
 app.get("/api/document/stream/:token", async (req, res) => {
+    // Security Gate: Reject direct address-bar navigation that exposes raw PDF to Chrome's native PDF plugin
+    if (req.headers['sec-fetch-dest'] === 'document' || req.headers['sec-fetch-mode'] === 'navigate') {
+        return res.status(403).send("Direct browser navigation to raw document stream is prohibited. Please view the document through the secure viewer.");
+    }
+
     const { token } = req.params;
     const orderId = verifyAccessToken(token);
     if (!orderId) return res.status(403).send("Invalid token");
@@ -4290,6 +4891,12 @@ app.get("/api/document/stream/:token", async (req, res) => {
     if (!isRegistered) {
         console.warn(`[ACCESS LOG] Stream rejected for ${orderId}: Device mismatch.`);
         return res.status(403).send("This document is already registered to another device.");
+    }
+
+    const sessionCheck = checkOrCreateViewingSession(orderId, deviceId);
+    if (!sessionCheck.valid) {
+        console.warn(`[ACCESS LOG] Stream rejected for ${orderId}: 10-minute viewing session expired.`);
+        return res.status(403).send("Viewing session expired (10-minute limit reached). Please reopen the document from your secure email link.");
     }
     
     const { data: order, error: orderErr } = await supabaseAdmin
