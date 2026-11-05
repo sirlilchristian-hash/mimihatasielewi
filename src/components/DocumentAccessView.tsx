@@ -12,9 +12,7 @@ import {
   Clock, 
   Lock, 
   Unlock, 
-  Hourglass,
   CheckCircle2,
-  Printer,
   Maximize2 
 } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -23,38 +21,43 @@ import * as pdfjsLib from 'pdfjs-dist';
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
 const OVERALL_SESSION_DURATION_MS = 600 * 1000; // 10 minutes (600 seconds)
-const NEW_PAGE_READING_DURATION_MS = 120 * 1000; // 2 minutes (120 seconds)
-const REVISIT_TRANSITION_DURATION_MS = 60 * 1000; // 1 minute (60 seconds)
+const BLOCK_PROGRESSION_DURATION_MS = 300 * 1000; // 5 minutes (300 seconds)
+const BLOCK_PAGE_SIZE = 4;
 
-interface PageReadingState {
-  firstOpenedAt: number;
-  readingExpiresAt: number;
-  isCompleted: boolean;
-  hasArrived?: boolean;
+export function getBlockIndexForPage(page: number): number {
+  return Math.floor((Math.max(1, page) - 1) / BLOCK_PAGE_SIZE) + 1;
 }
 
-interface ActiveTransitionState {
-  destinationPage: number;
-  expiresAt: number;
+export function getBlockPageRange(blockIndex: number, totalPages?: number): { startPage: number; endPage: number } {
+  const startPage = (Math.max(1, blockIndex) - 1) * BLOCK_PAGE_SIZE + 1;
+  const maxPage = totalPages || 9999;
+  const endPage = Math.min(startPage + BLOCK_PAGE_SIZE - 1, maxPage);
+  return { startPage, endPage };
 }
 
-interface PersistedSessionState {
+interface BlockTimerState {
+  blockIndex: number;
+  startedAt: number;
+  eligibilityExpiresAt: number;
+  isEligibleForNext: boolean;
+}
+
+interface PersistedBlockSessionState {
   overallExpiresAt: number;
-  visitedPages: number[];
   currentPage: number;
-  pageReadingTimers: Record<number, PageReadingState>;
-  activeTransition: ActiveTransitionState | null;
+  activeBlock: number;
+  blockTimers: Record<number, BlockTimerState>;
   savedAt: number;
 }
 
-function getStoredSession(token: string): PersistedSessionState | null {
+function getStoredBlockSession(token: string): PersistedBlockSessionState | null {
   try {
     if (typeof window === 'undefined' || !window.sessionStorage) return null;
-    const raw = window.sessionStorage.getItem(`godrery_session_${token}`);
+    const raw = window.sessionStorage.getItem(`godrery_block_session_${token}`);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed.overallExpiresAt === 'number') {
-      return parsed as PersistedSessionState;
+      return parsed as PersistedBlockSessionState;
     }
   } catch (e) {
     // ignore parse error
@@ -62,10 +65,10 @@ function getStoredSession(token: string): PersistedSessionState | null {
   return null;
 }
 
-function saveStoredSession(token: string, state: Omit<PersistedSessionState, 'savedAt'>) {
+function saveStoredBlockSession(token: string, state: Omit<PersistedBlockSessionState, 'savedAt'>) {
   try {
     if (typeof window === 'undefined' || !window.sessionStorage) return;
-    window.sessionStorage.setItem(`godrery_session_${token}`, JSON.stringify({
+    window.sessionStorage.setItem(`godrery_block_session_${token}`, JSON.stringify({
       ...state,
       savedAt: Date.now()
     }));
@@ -75,7 +78,7 @@ function saveStoredSession(token: string, state: Omit<PersistedSessionState, 'sa
 }
 
 function PdfCanvasViewer({ token }: { token: string }) {
-  const initialSaved = useRef(getStoredSession(token)).current;
+  const initialSaved = useRef(getStoredBlockSession(token)).current;
   const now = Date.now();
   const isInitialExpired = Boolean(initialSaved && initialSaved.overallExpiresAt <= now);
 
@@ -109,80 +112,68 @@ function PdfCanvasViewer({ token }: { token: string }) {
   });
   const [overallSessionExpired, setOverallSessionExpired] = useState(isInitialExpired);
 
-  // Visited pages set (Page 1 welcome page is always visited initially)
-  const [visitedPages, setVisitedPages] = useState<number[]>(() => {
-    if (initialSaved && !isInitialExpired && Array.isArray(initialSaved.visitedPages)) {
-      return initialSaved.visitedPages;
+  // Four-Page Block Model State
+  const [activeBlock, setActiveBlock] = useState<number>(() => {
+    if (initialSaved && !isInitialExpired && typeof initialSaved.activeBlock === 'number') {
+      return initialSaved.activeBlock;
     }
-    return [1];
+    return 1;
   });
 
-  // Page reading timer state
-  // Welcome page (1) is free: readingExpiresAt <= now, isCompleted = true, hasArrived = true
-  const [pageReadingTimers, setPageReadingTimers] = useState<Record<number, PageReadingState>>(() => {
-    if (initialSaved && !isInitialExpired && initialSaved.pageReadingTimers) {
-      const timers = { ...initialSaved.pageReadingTimers };
-      for (const [p, t] of Object.entries(timers)) {
-        if (t && !t.isCompleted && t.hasArrived && now >= t.readingExpiresAt) {
-          timers[Number(p)] = { ...t, isCompleted: true };
+  const [blockTimers, setBlockTimers] = useState<Record<number, BlockTimerState>>(() => {
+    if (initialSaved && !isInitialExpired && initialSaved.blockTimers) {
+      const timers = { ...initialSaved.blockTimers };
+      for (const [b, t] of Object.entries(timers)) {
+        if (t && !t.isEligibleForNext && now >= t.eligibilityExpiresAt) {
+          timers[Number(b)] = { ...t, isEligibleForNext: true };
         }
       }
       return timers;
     }
     return {
-      1: { firstOpenedAt: now, readingExpiresAt: now, isCompleted: true, hasArrived: true }
+      1: {
+        blockIndex: 1,
+        startedAt: now,
+        eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
+        isEligibleForNext: false
+      }
     };
   });
-  const [pageReadingRemainingSeconds, setPageReadingRemainingSeconds] = useState<number>(() => {
-    if (initialSaved && !isInitialExpired) {
-      const curP = initialSaved.currentPage || 1;
-      const curTimer = initialSaved.pageReadingTimers?.[curP];
-      if (curTimer && !curTimer.isCompleted && curTimer.hasArrived) {
-        return Math.max(0, Math.ceil((curTimer.readingExpiresAt - now) / 1000));
-      }
-    }
-    return 0;
-  });
 
-  // One-minute navigation transition gate
-  const [activeTransition, setActiveTransition] = useState<ActiveTransitionState | null>(() => {
-    if (initialSaved && !isInitialExpired && initialSaved.activeTransition) {
-      if (now < initialSaved.activeTransition.expiresAt) {
-        return initialSaved.activeTransition;
-      }
-    }
-    return null;
-  });
-  const [transitionRemainingSeconds, setTransitionRemainingSeconds] = useState<number>(() => {
-    if (initialSaved && !isInitialExpired && initialSaved.activeTransition) {
-      return Math.max(0, Math.ceil((initialSaved.activeTransition.expiresAt - now) / 1000));
-    }
-    return 0;
+  const currentBlockTimer = blockTimers[activeBlock] || {
+    blockIndex: activeBlock,
+    startedAt: now,
+    eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
+    isEligibleForNext: false
+  };
+
+  const [blockRemainingSeconds, setBlockRemainingSeconds] = useState<number>(() => {
+    if (currentBlockTimer.isEligibleForNext) return 0;
+    return Math.max(0, Math.ceil((currentBlockTimer.eligibilityExpiresAt - now) / 1000));
   });
 
   // Persist session to sessionStorage on state changes
   useEffect(() => {
     if (overallSessionExpired) {
       try {
-        window.sessionStorage.removeItem(`godrery_session_${token}`);
+        window.sessionStorage.removeItem(`godrery_block_session_${token}`);
       } catch {}
       return;
     }
-    saveStoredSession(token, {
+    saveStoredBlockSession(token, {
       overallExpiresAt,
-      visitedPages,
       currentPage,
-      pageReadingTimers,
-      activeTransition
+      activeBlock,
+      blockTimers
     });
-  }, [token, overallExpiresAt, visitedPages, currentPage, pageReadingTimers, activeTransition, overallSessionExpired]);
+  }, [token, overallExpiresAt, currentPage, activeBlock, blockTimers, overallSessionExpired]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const renderTaskRef = useRef<any>(null);
   const currentUnscaledDimRef = useRef<{ width: number; height: number } | null>(null);
 
-  // Monotonic client clock anchor to resist local wall-clock shifts and sustain offline countdowns
+  // Monotonic client clock anchor
   const timeAnchorRef = useRef<{ perfNow: number; wallNow: number }>({
     perfNow: typeof performance !== 'undefined' ? performance.now() : 0,
     wallNow: Date.now()
@@ -223,9 +214,8 @@ function PdfCanvasViewer({ token }: { token: string }) {
 
   const effectiveScale = (baseFitScale || 1.0) * zoomMultiplier;
 
-  // Arrival notification: sends arrival confirmation to server when page finishes rendering
+  // Arrival notification: notifies server when page finishes rendering
   const notifyArrival = useCallback(async (pageNum: number) => {
-    if (pageNum === 1) return; // Welcome page is free
     try {
       const res = await fetch(`/api/document/session/${token}/arrive`, {
         method: 'POST',
@@ -234,44 +224,26 @@ function PdfCanvasViewer({ token }: { token: string }) {
       });
       const data = await res.json();
       if (data.success && data.arrived) {
-        setPageReadingTimers(prev => {
-          const existing = prev[pageNum];
-          return {
-            ...prev,
-            [pageNum]: {
-              firstOpenedAt: existing?.firstOpenedAt || Date.now(),
-              readingExpiresAt: data.expiresAt,
-              isCompleted: data.remainingSeconds <= 0,
-              hasArrived: true
-            }
-          };
-        });
-        setPageReadingRemainingSeconds(data.remainingSeconds);
+        if (data.activeBlock && data.activeBlock !== activeBlock) {
+          setActiveBlock(data.activeBlock);
+        }
+        setBlockTimers(prev => ({
+          ...prev,
+          [data.activeBlock]: {
+            blockIndex: data.activeBlock,
+            startedAt: prev[data.activeBlock]?.startedAt || Date.now(),
+            eligibilityExpiresAt: prev[data.activeBlock]?.eligibilityExpiresAt || (Date.now() + (data.remainingSeconds * 1000)),
+            isEligibleForNext: Boolean(data.isEligibleForNext)
+          }
+        }));
+        if (typeof data.remainingSeconds === 'number') {
+          setBlockRemainingSeconds(data.remainingSeconds);
+        }
       }
     } catch (err) {
-      // Offline fallback: start monotonic countdown if not already started
-      setPageReadingTimers(prev => {
-        if (prev[pageNum]?.hasArrived) return prev;
-        const now = getMonotonicNow();
-        return {
-          ...prev,
-          [pageNum]: {
-            firstOpenedAt: now,
-            readingExpiresAt: now + NEW_PAGE_READING_DURATION_MS,
-            isCompleted: false,
-            hasArrived: true
-          }
-        };
-      });
+      // Offline fallback: keep existing block timer running locally
     }
-  }, [token, getMonotonicNow]);
-
-  // Determine if page-changing inputs should be locked
-  const currentTimer = pageReadingTimers[currentPage];
-  const nowForLock = getMonotonicNow();
-  const isPageReadingActive = Boolean(currentTimer && !currentTimer.isCompleted && nowForLock < currentTimer.readingExpiresAt);
-  const isTransitionActive = Boolean(activeTransition && nowForLock < activeTransition.expiresAt);
-  const isNavigationLocked = isPageReadingActive || isTransitionActive || overallSessionExpired;
+  }, [token, activeBlock]);
 
   // Sync session state from server
   const syncServerSession = useCallback(async () => {
@@ -293,28 +265,23 @@ function PdfCanvasViewer({ token }: { token: string }) {
           setOverallRemainingSeconds(rem);
           if (rem <= 0) setOverallSessionExpired(true);
         }
-        if (Array.isArray(data.visitedPages)) {
-          setVisitedPages(data.visitedPages);
-        }
         if (data.currentPage && data.currentPage !== currentPage) {
           setCurrentPage(data.currentPage);
         }
-        if (data.pageTimer) {
-          setPageReadingTimers(prev => ({
+        if (typeof data.activeBlock === 'number') {
+          setActiveBlock(data.activeBlock);
+        }
+        if (data.blockTimer) {
+          setBlockTimers(prev => ({
             ...prev,
-            [data.pageTimer.currentPage]: {
-              firstOpenedAt: prev[data.pageTimer.currentPage]?.firstOpenedAt || Date.now(),
-              readingExpiresAt: data.pageTimer.readingExpiresAt,
-              isCompleted: data.pageTimer.isCompleted,
-              hasArrived: true
+            [data.blockTimer.blockIndex]: {
+              blockIndex: data.blockTimer.blockIndex,
+              startedAt: data.blockTimer.startedAt,
+              eligibilityExpiresAt: data.blockTimer.eligibilityExpiresAt,
+              isEligibleForNext: Boolean(data.blockTimer.isEligibleForNext)
             }
           }));
-        }
-        if (data.activeTransition) {
-          setActiveTransition({
-            destinationPage: data.activeTransition.destinationPage,
-            expiresAt: data.activeTransition.expiresAt
-          });
+          setBlockRemainingSeconds(data.blockTimer.remainingSeconds);
         }
       }
     } catch (e) {
@@ -327,15 +294,11 @@ function PdfCanvasViewer({ token }: { token: string }) {
     syncServerSession();
   }, [syncServerSession]);
 
-  // Revalidate with server when network connectivity returns or tab regains visibility
+  // Revalidate with server when tab regains visibility or network returns
   useEffect(() => {
-    const handleOnline = () => {
-      syncServerSession();
-    };
+    const handleOnline = () => syncServerSession();
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        syncServerSession();
-      }
+      if (document.visibilityState === 'visible') syncServerSession();
     };
     window.addEventListener('online', handleOnline);
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -345,7 +308,7 @@ function PdfCanvasViewer({ token }: { token: string }) {
     };
   }, [syncServerSession]);
 
-  // Master countdown timer interval (runs every 500ms for smooth, accurate timestamps)
+  // Master countdown timer interval (runs every 500ms)
   useEffect(() => {
     const timer = setInterval(() => {
       const now = getMonotonicNow();
@@ -357,43 +320,26 @@ function PdfCanvasViewer({ token }: { token: string }) {
         setOverallSessionExpired(true);
       }
 
-      // 2. Current page reading countdown
-      const pTimer = pageReadingTimers[currentPage];
-      if (pTimer && !pTimer.isCompleted) {
-        const pageRem = Math.max(0, Math.ceil((pTimer.readingExpiresAt - now) / 1000));
-        setPageReadingRemainingSeconds(pageRem);
-        if (pageRem <= 0) {
-          setPageReadingTimers(prev => ({
-            ...prev,
-            [currentPage]: { ...prev[currentPage], isCompleted: true }
-          }));
+      // 2. Block 5-minute eligibility timer
+      const bTimer = blockTimers[activeBlock];
+      if (bTimer) {
+        if (bTimer.isEligibleForNext) {
+          setBlockRemainingSeconds(0);
+        } else {
+          const bRem = Math.max(0, Math.ceil((bTimer.eligibilityExpiresAt - now) / 1000));
+          setBlockRemainingSeconds(bRem);
+          if (bRem <= 0) {
+            setBlockTimers(prev => ({
+              ...prev,
+              [activeBlock]: { ...prev[activeBlock], isEligibleForNext: true }
+            }));
+          }
         }
-      } else {
-        setPageReadingRemainingSeconds(0);
-      }
-
-      // 3. Active 1-minute transition countdown
-      if (activeTransition) {
-        const transRem = Math.max(0, Math.ceil((activeTransition.expiresAt - now) / 1000));
-        setTransitionRemainingSeconds(transRem);
-        if (transRem <= 0) {
-          // Complete transition automatically!
-          const dest = activeTransition.destinationPage;
-          setActiveTransition(null);
-          setCurrentPage(dest);
-
-          // Notify server of completed transition
-          fetch(`/api/document/session/${token}/complete-transition`, {
-            method: 'POST'
-          }).catch(() => {});
-        }
-      } else {
-        setTransitionRemainingSeconds(0);
       }
     }, 500);
 
     return () => clearInterval(timer);
-  }, [overallExpiresAt, currentPage, pageReadingTimers, activeTransition, token, getMonotonicNow]);
+  }, [overallExpiresAt, activeBlock, blockTimers, getMonotonicNow]);
 
   // Load PDF Document
   useEffect(() => {
@@ -483,33 +429,49 @@ function PdfCanvasViewer({ token }: { token: string }) {
     };
   }, [pdfDoc, currentPage, effectiveScale, updateFitScale, notifyArrival, renderRetryTrigger]);
 
-  // Block page-changing keyboard shortcuts when navigation is locked
+  // Block print shortcuts (Ctrl+P, Cmd+P) and save/download shortcuts (Ctrl+S, Cmd+S) completely
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      const pageKeys = ['ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End', ' '];
-      if (pageKeys.includes(e.key)) {
-        if (isNavigationLocked) {
-          e.preventDefault();
-          e.stopPropagation();
-        }
+      if ((e.ctrlKey || e.metaKey) && (
+        e.key === 'p' || e.key === 'P' ||
+        e.key === 's' || e.key === 'S'
+      )) {
+        e.preventDefault();
+        e.stopPropagation();
       }
     };
-
     window.addEventListener('keydown', handleKeyDown, { capture: true });
     return () => {
       window.removeEventListener('keydown', handleKeyDown, { capture: true });
     };
-  }, [isNavigationLocked]);
+  }, []);
 
-  // Navigation Handler
+  // Navigation Handler for Four-Page Block Model
   const handleRequestNavigation = async (targetPage: number) => {
-    if (isNavigationLocked) return;
+    if (overallSessionExpired) return;
     if (targetPage === currentPage || targetPage < 1 || targetPage > numPages) return;
 
-    const now = Date.now();
-    const isVisited = visitedPages.includes(targetPage);
+    const targetBlock = getBlockIndexForPage(targetPage);
 
-    // Call server navigation endpoint for authoritative check
+    // Rule 1: Cannot navigate to previously completed blocks (permanently locked)
+    if (targetBlock < activeBlock) {
+      return;
+    }
+
+    // Rule 2: Cannot skip blocks
+    if (targetBlock > activeBlock + 1) {
+      return;
+    }
+
+    // Rule 3: Moving into next block requires eligibility (5 minutes in active block)
+    if (targetBlock === activeBlock + 1) {
+      const activeTimer = blockTimers[activeBlock];
+      if (!activeTimer?.isEligibleForNext) {
+        return;
+      }
+    }
+
+    // Call server navigation endpoint for authoritative validation
     try {
       const res = await fetch(`/api/document/session/${token}/navigate`, {
         method: 'POST',
@@ -519,73 +481,47 @@ function PdfCanvasViewer({ token }: { token: string }) {
       const data = await res.json();
 
       if (!data.success) {
-        if (data.error === 'page_reading_active') {
-          setPageReadingRemainingSeconds(data.remainingSeconds || 10);
+        if (data.error === 'next_block_not_eligible' && typeof data.remainingSeconds === 'number') {
+          setBlockRemainingSeconds(data.remainingSeconds);
         }
         return;
       }
 
-      if (data.transitioning) {
-        // Start 1-minute navigation gate
-        setActiveTransition({
-          destinationPage: targetPage,
-          expiresAt: data.expiresAt || (now + 60 * 1000)
-        });
-        setTransitionRemainingSeconds(data.remainingSeconds || 60);
-      } else if (data.navigated) {
-        // Navigated to new page
+      if (data.navigated) {
         setCurrentPage(targetPage);
-        setVisitedPages(prev => Array.from(new Set([...prev, targetPage])));
-        
-        if (targetPage === 1) {
-          setPageReadingTimers(prev => ({
+        if (data.blockAdvanced && data.activeBlock) {
+          setActiveBlock(data.activeBlock);
+          const now = Date.now();
+          setBlockTimers(prev => ({
             ...prev,
-            1: { firstOpenedAt: now, readingExpiresAt: now, isCompleted: true, hasArrived: true }
-          }));
-          setPageReadingRemainingSeconds(0);
-        } else {
-          // Waiting for arrival event when page canvas finishes rendering
-          setPageReadingTimers(prev => ({
-            ...prev,
-            [targetPage]: prev[targetPage] || {
-              firstOpenedAt: now,
-              readingExpiresAt: now + NEW_PAGE_READING_DURATION_MS,
-              isCompleted: false,
-              hasArrived: false
+            [data.activeBlock]: {
+              blockIndex: data.activeBlock,
+              startedAt: now,
+              eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
+              isEligibleForNext: false
             }
           }));
-          setPageReadingRemainingSeconds(120);
+          setBlockRemainingSeconds(300);
         }
       }
     } catch (e) {
-      // Local fallback in case of transient offline
-      if (isVisited) {
-        setActiveTransition({
-          destinationPage: targetPage,
-          expiresAt: now + REVISIT_TRANSITION_DURATION_MS
-        });
-        setTransitionRemainingSeconds(60);
-      } else {
+      // Local fallback for offline / transient error
+      if (targetBlock === activeBlock) {
         setCurrentPage(targetPage);
-        setVisitedPages(prev => Array.from(new Set([...prev, targetPage])));
-        if (targetPage === 1) {
-          setPageReadingTimers(prev => ({
-            ...prev,
-            1: { firstOpenedAt: now, readingExpiresAt: now, isCompleted: true, hasArrived: true }
-          }));
-          setPageReadingRemainingSeconds(0);
-        } else {
-          setPageReadingTimers(prev => ({
-            ...prev,
-            [targetPage]: prev[targetPage] || {
-              firstOpenedAt: now,
-              readingExpiresAt: now + NEW_PAGE_READING_DURATION_MS,
-              isCompleted: false,
-              hasArrived: false
-            }
-          }));
-          setPageReadingRemainingSeconds(120);
-        }
+      } else if (targetBlock === activeBlock + 1 && blockTimers[activeBlock]?.isEligibleForNext) {
+        setActiveBlock(targetBlock);
+        setCurrentPage(targetPage);
+        const now = Date.now();
+        setBlockTimers(prev => ({
+          ...prev,
+          [targetBlock]: {
+            blockIndex: targetBlock,
+            startedAt: now,
+            eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
+            isEligibleForNext: false
+          }
+        }));
+        setBlockRemainingSeconds(300);
       }
     }
   };
@@ -595,6 +531,16 @@ function PdfCanvasViewer({ token }: { token: string }) {
     const rem = secs % 60;
     return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
   };
+
+  // Determine navigation capabilities
+  const currentBlockRange = getBlockPageRange(activeBlock, numPages);
+  const isEligibleForNext = Boolean(blockTimers[activeBlock]?.isEligibleForNext);
+
+  const canGoPrev = currentPage > 1 && getBlockIndexForPage(currentPage - 1) === activeBlock;
+  const canGoNext = currentPage < numPages && (
+    getBlockIndexForPage(currentPage + 1) === activeBlock ||
+    (getBlockIndexForPage(currentPage + 1) === activeBlock + 1 && isEligibleForNext)
+  );
 
   // Expired Screen
   if (overallSessionExpired) {
@@ -649,6 +595,16 @@ function PdfCanvasViewer({ token }: { token: string }) {
       className="flex-grow w-full flex flex-col bg-slate-950 relative overflow-hidden select-none"
       onContextMenu={e => e.preventDefault()}
     >
+      {/* Suppress all printing */}
+      <style>{`
+        @media print {
+          body, html, * {
+            display: none !important;
+            visibility: hidden !important;
+          }
+        }
+      `}</style>
+
       {/* Watermark Overlay */}
       <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-10 opacity-[0.03] overflow-hidden select-none">
         <div className="text-6xl font-black text-white rotate-[-35deg] whitespace-nowrap tracking-widest">
@@ -663,14 +619,14 @@ function PdfCanvasViewer({ token }: { token: string }) {
         <div className="flex items-center gap-3">
           <button
             onClick={() => handleRequestNavigation(currentPage - 1)}
-            disabled={isNavigationLocked || currentPage <= 1}
+            disabled={!canGoPrev}
             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors cursor-pointer flex items-center gap-1 text-xs"
             title={
-              isNavigationLocked 
-                ? "Navigation locked while timer is active" 
-                : currentPage > 1 && visitedPages.includes(currentPage - 1)
-                  ? `Revisit Page ${currentPage - 1} (Requires 1-min gate)`
-                  : `Previous Page`
+              currentPage <= 1
+                ? "First page"
+                : getBlockIndexForPage(currentPage - 1) < activeBlock
+                  ? "Previous block is permanently locked"
+                  : `Previous Page (${currentPage - 1})`
             }
           >
             <ChevronLeft className="w-4 h-4" />
@@ -684,15 +640,41 @@ function PdfCanvasViewer({ token }: { token: string }) {
             </span>
             <select
               value={currentPage}
-              disabled={isNavigationLocked}
               onChange={e => handleRequestNavigation(Number(e.target.value))}
-              className="bg-slate-800 text-white text-xs rounded-lg px-2 py-1 border border-slate-700 disabled:opacity-50 disabled:cursor-not-allowed outline-none focus:border-[#00D26A]"
+              className="bg-slate-800 text-white text-xs rounded-lg px-2 py-1 border border-slate-700 outline-none focus:border-[#00D26A]"
             >
               {Array.from({ length: numPages }, (_, i) => i + 1).map(p => {
-                const isVisited = visitedPages.includes(p);
+                const pBlock = getBlockIndexForPage(p);
+                const isCurrentBlock = pBlock === activeBlock;
+                const isPastBlock = pBlock < activeBlock;
+                const isNextBlock = pBlock === activeBlock + 1;
+                const isFutureLocked = pBlock > activeBlock + 1;
+
+                let label = `Page ${p} (Block ${pBlock})`;
+                let disabled = false;
+
+                if (isPastBlock) {
+                  label = `Page ${p} (Block ${pBlock} • Locked)`;
+                  disabled = true;
+                } else if (isCurrentBlock) {
+                  label = `Page ${p} (Block ${pBlock} • Active)`;
+                  disabled = false;
+                } else if (isNextBlock) {
+                  if (isEligibleForNext) {
+                    label = `Page ${p} (Block ${pBlock} • Eligible to Enter)`;
+                    disabled = false;
+                  } else {
+                    label = `Page ${p} (Block ${pBlock} • Unlocks in ${formatTime(blockRemainingSeconds)})`;
+                    disabled = true;
+                  }
+                } else if (isFutureLocked) {
+                  label = `Page ${p} (Block ${pBlock} • Locked)`;
+                  disabled = true;
+                }
+
                 return (
-                  <option key={p} value={p}>
-                    {p} {p === 1 ? '(Welcome)' : isVisited ? '(Visited • 1-min gate)' : '(New • 2-min timer)'}
+                  <option key={p} value={p} disabled={disabled}>
+                    {label}
                   </option>
                 );
               })}
@@ -702,14 +684,16 @@ function PdfCanvasViewer({ token }: { token: string }) {
 
           <button
             onClick={() => handleRequestNavigation(currentPage + 1)}
-            disabled={isNavigationLocked || currentPage >= numPages}
+            disabled={!canGoNext}
             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors cursor-pointer flex items-center gap-1 text-xs"
             title={
-              isNavigationLocked 
-                ? "Navigation locked while timer is active" 
-                : currentPage < numPages && visitedPages.includes(currentPage + 1)
-                  ? `Revisit Page ${currentPage + 1} (Requires 1-min gate)`
-                  : `Next: Page ${currentPage + 1} (Starts 2-min countdown)`
+              currentPage >= numPages
+                ? "Last page"
+                : getBlockIndexForPage(currentPage + 1) === activeBlock
+                  ? `Next Page (${currentPage + 1})`
+                  : isEligibleForNext
+                    ? `Enter Block ${activeBlock + 1} (Page ${currentPage + 1})`
+                    : `Next block unlocks in ${formatTime(blockRemainingSeconds)}`
             }
           >
             <span className="hidden sm:inline">Next</span>
@@ -720,21 +704,21 @@ function PdfCanvasViewer({ token }: { token: string }) {
         {/* Dynamic Timers and Reading Status */}
         <div className="flex flex-wrap items-center gap-3">
           
-          {/* Per-Page Reading Timer Badge */}
-          {currentPage === 1 ? (
-            <div className="flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-full text-emerald-400 text-xs font-medium">
-              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-              <span>Welcome Page (Free Access)</span>
-            </div>
-          ) : isPageReadingActive ? (
-            <div className="flex items-center gap-1.5 bg-rose-500/10 border border-rose-500/30 px-3 py-1 rounded-full text-rose-400 text-xs font-medium animate-pulse">
-              <Lock className="w-3.5 h-3.5 shrink-0" />
-              <span>Page {currentPage} Reading: <strong>{formatTime(pageReadingRemainingSeconds)}</strong> (Locked)</span>
+          {/* Active Block Indicator Badge */}
+          <div className="flex items-center gap-1.5 bg-blue-500/10 border border-blue-500/30 px-3 py-1 rounded-full text-blue-400 text-xs font-semibold">
+            <span>Block {activeBlock} (Pages {currentBlockRange.startPage}–{currentBlockRange.endPage})</span>
+          </div>
+
+          {/* Block Eligibility Countdown / Status Badge */}
+          {isEligibleForNext ? (
+            <div className="flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/30 px-3 py-1 rounded-full text-emerald-400 text-xs font-semibold">
+              <Unlock className="w-3.5 h-3.5 shrink-0" />
+              <span>Block {activeBlock + 1} Eligible to Enter</span>
             </div>
           ) : (
-            <div className="flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-full text-emerald-400 text-xs font-medium">
-              <Unlock className="w-3.5 h-3.5 shrink-0" />
-              <span>Page {currentPage} Complete (Unlocked)</span>
+            <div className="flex items-center gap-1.5 bg-rose-500/10 border border-rose-500/30 px-3 py-1 rounded-full text-rose-400 text-xs font-medium">
+              <Lock className="w-3.5 h-3.5 shrink-0" />
+              <span>Next Block Unlocks In: <strong>{formatTime(blockRemainingSeconds)}</strong></span>
             </div>
           )}
 
@@ -744,7 +728,7 @@ function PdfCanvasViewer({ token }: { token: string }) {
             <span>Overall Session: <strong>{formatTime(overallRemainingSeconds)}</strong></span>
           </div>
 
-          {/* Zoom & Viewport Fit Controls (Always interactive during reading!) */}
+          {/* Zoom & Viewport Fit Controls (Always interactive during reading) */}
           <div className="flex items-center gap-1 bg-slate-800 rounded-lg p-1">
             <button
               type="button"
@@ -777,105 +761,16 @@ function PdfCanvasViewer({ token }: { token: string }) {
               <ZoomIn className="w-4 h-4" />
             </button>
           </div>
-
-          {/* Single-Page Print Control */}
-          <button
-            type="button"
-            onClick={() => window.print()}
-            className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
-            title="Print Active Page Only"
-          >
-            <Printer className="w-4 h-4 text-emerald-400" />
-            <span className="hidden sm:inline">Print Page</span>
-          </button>
         </div>
       </div>
-
-      {/* Active One-Minute Transition Gate Banner */}
-      {isTransitionActive && activeTransition && (
-        <div className="bg-amber-600/90 text-white px-4 py-2 flex items-center justify-between text-xs font-semibold z-20 shadow-lg animate-in slide-in-from-top duration-300">
-          <div className="flex items-center gap-2">
-            <Hourglass className="w-4 h-4 animate-spin shrink-0 text-amber-200" />
-            <span>
-              1-Minute Navigation Gate: Opening previously visited Page {activeTransition.destinationPage} in{' '}
-              <strong>{formatTime(transitionRemainingSeconds)}</strong>. All navigation changes are locked.
-            </span>
-          </div>
-          <span className="bg-amber-900/40 px-2 py-0.5 rounded text-[11px] font-mono">
-            {transitionRemainingSeconds}s remaining
-          </span>
-        </div>
-      )}
-
-      {/* Scoped Single-Page Print CSS */}
-      <style>{`
-        @media print {
-          @page {
-            size: auto;
-            margin: 10mm;
-          }
-          body {
-            visibility: hidden !important;
-            background: white !important;
-          }
-          #godrery-print-wrapper,
-          #godrery-print-wrapper * {
-            visibility: visible !important;
-          }
-          #godrery-print-wrapper {
-            position: fixed !important;
-            left: 0 !important;
-            top: 0 !important;
-            width: 100vw !important;
-            height: 100vh !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            background: white !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            z-index: 999999 !important;
-          }
-          #godrery-active-canvas {
-            max-width: 100% !important;
-            max-height: 100% !important;
-            width: auto !important;
-            height: auto !important;
-            box-shadow: none !important;
-            border: none !important;
-            display: block !important;
-          }
-          .godrery-print-watermark {
-            display: block !important;
-            visibility: visible !important;
-            position: absolute !important;
-            top: 50% !important;
-            left: 50% !important;
-            transform: translate(-50%, -50%) rotate(-35deg) !important;
-            font-size: 24pt !important;
-            font-weight: 900 !important;
-            color: rgba(0, 0, 0, 0.12) !important;
-            white-space: nowrap !important;
-            pointer-events: none !important;
-            letter-spacing: 2px !important;
-            z-index: 1000000 !important;
-          }
-        }
-      `}</style>
 
       {/* Canvas Container with Auto-Fit Viewport & Disabled Context Menu */}
       <div 
         ref={containerRef}
         className="flex-grow overflow-auto flex items-center justify-center p-4 relative z-0"
-        onWheel={e => {
-          // Block page scrolling / gestures from switching pages
-          if (isNavigationLocked && e.ctrlKey) {
-            // allow pinch zoom if browser supports
-          }
-        }}
       >
         <div 
-          id="godrery-print-wrapper"
+          id="godrery-canvas-wrapper"
           className="shadow-2xl bg-white rounded-lg overflow-hidden border border-slate-700 relative min-w-[200px] min-h-[200px]"
         >
           {pageRenderError && (
@@ -894,9 +789,6 @@ function PdfCanvasViewer({ token }: { token: string }) {
               </button>
             </div>
           )}
-          <div className="godrery-print-watermark hidden">
-            GODRERY PUBLISHERS • PAGE {currentPage} OF {numPages} • SINGLE PAGE PRINT
-          </div>
           <canvas 
             id="godrery-active-canvas"
             ref={canvasRef} 

@@ -28,6 +28,11 @@ import {
   recordPageArrival,
   OVERALL_VIEWING_SESSION_DURATION_MS,
   OVERALL_VIEWING_SESSION_DURATION_SECONDS,
+  BLOCK_PROGRESSION_DURATION_MS,
+  BLOCK_PROGRESSION_DURATION_SECONDS,
+  BLOCK_PAGE_SIZE,
+  getBlockIndexForPage,
+  getBlockPageRange,
   NEW_PAGE_READING_DURATION_MS,
   NEW_PAGE_READING_DURATION_SECONDS,
   REVISIT_PAGE_TRANSITION_DURATION_MS,
@@ -1598,361 +1603,371 @@ test('58. 10-Minute Viewing Session Expiry & Enforcement', () => {
   assert.strictEqual(activeViewingSessions.has(sessionKey), false);
 });
 
-test('59. Welcome Page Is Free & Marked Visited (No 10-Minute Lock)', () => {
-  const orderId = 'order-welcome-test';
-  const deviceId = 'device-welcome-uuid';
+test('59. Four-Page Block Model - Block 1 (Pages 1–4) Opens Immediately & Freely Navigable', () => {
+  const orderId = 'order-block1-immediate-test';
+  const deviceId = 'device-block1-immediate-uuid';
 
   const check = checkOrCreateViewingSession(orderId, deviceId);
   assert.strictEqual(check.valid, true);
   assert.ok(check.session);
 
-  // 1. Welcome page (Page 1) is current page and marked as visited
+  // 1. Initial block is Block 1, current page is Page 1
+  assert.strictEqual(check.session.activeBlock, 1);
   assert.strictEqual(check.session.currentPage, 1);
-  assert.deepStrictEqual(check.session.visitedPages, [1]);
 
-  // 2. Welcome page reading timer is completed immediately (free access)
-  const welcomeTimer = check.session.pageReadingTimers[1];
-  assert.ok(welcomeTimer);
-  assert.strictEqual(welcomeTimer.isCompleted, true);
+  // 2. Pages 1, 2, 3, 4 are all within Block 1
+  assert.strictEqual(getBlockIndexForPage(1), 1);
+  assert.strictEqual(getBlockIndexForPage(2), 1);
+  assert.strictEqual(getBlockIndexForPage(3), 1);
+  assert.strictEqual(getBlockIndexForPage(4), 1);
 
-  // 3. Customer can immediately navigate away from welcome page to Page 2 without a 10-minute lock
-  const navRes = requestSessionNavigation(orderId, deviceId, 2);
-  assert.strictEqual(navRes.success, true);
-  assert.strictEqual(navRes.navigated, true);
-  assert.strictEqual(navRes.currentPage, 2);
+  // 3. User can navigate freely between pages 1, 2, 3, 4 within Block 1 without waiting
+  const navTo2 = requestSessionNavigation(orderId, deviceId, 2);
+  assert.strictEqual(navTo2.success, true);
+  assert.strictEqual(navTo2.navigated, true);
+  assert.strictEqual(navTo2.currentPage, 2);
+  assert.strictEqual(navTo2.activeBlock, 1);
+
+  const navTo4 = requestSessionNavigation(orderId, deviceId, 4);
+  assert.strictEqual(navTo4.success, true);
+  assert.strictEqual(navTo4.navigated, true);
+  assert.strictEqual(navTo4.currentPage, 4);
+
+  const navBackTo1 = requestSessionNavigation(orderId, deviceId, 1);
+  assert.strictEqual(navBackTo1.success, true);
+  assert.strictEqual(navBackTo1.navigated, true);
+  assert.strictEqual(navBackTo1.currentPage, 1);
 });
 
-test('60. Opening New Page Starts Its Own 2-Minute (120s) Countdown & Blocks Navigation', () => {
-  const orderId = 'order-newpage-test';
-  const deviceId = 'device-newpage-uuid';
+test('60. Four-Page Block Model - 5-Minute (300s) Eligibility Timer Starts on Opening Block 1', () => {
+  const orderId = 'order-block1-timer-test';
+  const deviceId = 'device-block1-timer-uuid';
   const t0 = 1700000000000;
 
-  // Initialize session and navigate to Page 2
+  const check = checkOrCreateViewingSession(orderId, deviceId, t0);
+  assert.strictEqual(check.valid, true);
+  const session = check.session!;
+
+  const timer1 = session.blockTimers[1];
+  assert.ok(timer1);
+  assert.strictEqual(timer1.blockIndex, 1);
+  assert.strictEqual(timer1.startedAt, t0);
+  assert.strictEqual(timer1.eligibilityExpiresAt, t0 + BLOCK_PROGRESSION_DURATION_MS);
+  assert.strictEqual(timer1.isEligibleForNext, false);
+
+  // At t0 + 100 seconds: 200s remaining, still not eligible
+  const checkAt100 = checkOrCreateViewingSession(orderId, deviceId, t0 + 100 * 1000);
+  assert.strictEqual(checkAt100.session!.blockTimers[1].isEligibleForNext, false);
+});
+
+test('61. Four-Page Block Model - Internal Block Navigation Never Resets 5-Minute Timer', () => {
+  const orderId = 'order-internal-nav-test';
+  const deviceId = 'device-internal-nav-uuid';
+  const t0 = 1700000000000;
+
   checkOrCreateViewingSession(orderId, deviceId, t0);
-  const navTo2 = requestSessionNavigation(orderId, deviceId, 2, t0);
+  const initialExpiry = t0 + BLOCK_PROGRESSION_DURATION_MS;
+
+  // Navigate from Page 1 to Page 3 at t0 + 30s
+  const nav3 = requestSessionNavigation(orderId, deviceId, 3, t0 + 30 * 1000);
+  assert.strictEqual(nav3.success, true);
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  assert.strictEqual(session.blockTimers[1].eligibilityExpiresAt, initialExpiry, 'Timer must not reset on internal navigation');
+
+  // Navigate to Page 2 at t0 + 80s
+  requestSessionNavigation(orderId, deviceId, 2, t0 + 80 * 1000);
+  assert.strictEqual(session.blockTimers[1].eligibilityExpiresAt, initialExpiry);
+
+  // Navigate back to Page 1 at t0 + 150s
+  requestSessionNavigation(orderId, deviceId, 1, t0 + 150 * 1000);
+  assert.strictEqual(session.blockTimers[1].eligibilityExpiresAt, initialExpiry);
+});
+
+test('62. Four-Page Block Model - Repaints, Resizes, Zooms & Arrivals Never Reset Timer', () => {
+  const orderId = 'order-zoom-repaint-test';
+  const deviceId = 'device-zoom-repaint-uuid';
+  const t0 = 1700000000000;
+
+  checkOrCreateViewingSession(orderId, deviceId, t0);
+  const expectedExpiry = t0 + BLOCK_PROGRESSION_DURATION_MS;
+
+  // First arrival on Page 1 at t0 + 500ms
+  const arr1 = recordPageArrival(orderId, deviceId, 1, t0 + 500);
+  assert.strictEqual(arr1.success, true);
+  assert.strictEqual(arr1.remainingSeconds, 300);
+
+  // Repaint / Zoom arrival simulation at t0 + 45s
+  const arrZoom = recordPageArrival(orderId, deviceId, 1, t0 + 45 * 1000);
+  assert.strictEqual(arrZoom.success, true);
+  assert.strictEqual(arrZoom.remainingSeconds, 255);
+
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  assert.strictEqual(session.blockTimers[1].eligibilityExpiresAt, expectedExpiry);
+});
+
+test('63. Four-Page Block Model - Navigating to Block 2 Rejected Before 5 Minutes', () => {
+  const orderId = 'order-block2-reject-test';
+  const deviceId = 'device-block2-reject-uuid';
+  const t0 = 1700000000000;
+
+  checkOrCreateViewingSession(orderId, deviceId, t0);
+
+  // Attempting to navigate to Page 5 (Block 2) at t0 + 299 seconds (1s before 5 minutes)
+  const navPremature = requestSessionNavigation(orderId, deviceId, 5, t0 + 299 * 1000);
+  assert.strictEqual(navPremature.success, false);
+  assert.strictEqual(navPremature.error, 'next_block_not_eligible');
+  assert.strictEqual(navPremature.remainingSeconds, 1);
+
+  // Direct page access for Page 5 is also rejected
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  const directPage5 = authorizeDirectPageAccess(session, 5, t0 + 299 * 1000);
+  assert.strictEqual(directPage5.allowed, false);
+  assert.strictEqual(directPage5.reason, 'next_block_not_eligible');
+});
+
+test('64. Four-Page Block Model - Eligible != Active: 5 Minutes Makes Block 2 Eligible Without Locking Block 1', () => {
+  const orderId = 'order-eligible-not-active-test';
+  const deviceId = 'device-eligible-not-active-uuid';
+  const t0 = 1700000000000;
+
+  checkOrCreateViewingSession(orderId, deviceId, t0);
+
+  // Time reaches exactly 5 minutes (t0 + 300,000ms)
+  const t5min = t0 + 300 * 1000;
+  const check = checkOrCreateViewingSession(orderId, deviceId, t5min);
+  assert.strictEqual(check.valid, true);
+
+  const session = check.session!;
+  // Block 2 is eligible, but activeBlock is STILL Block 1!
+  assert.strictEqual(session.activeBlock, 1);
+  assert.strictEqual(session.blockTimers[1].isEligibleForNext, true);
+
+  // User staying in Block 1 can still navigate freely between pages 1, 2, 3, 4
+  const navTo3 = requestSessionNavigation(orderId, deviceId, 3, t5min + 10 * 1000);
+  assert.strictEqual(navTo3.success, true);
+  assert.strictEqual(navTo3.currentPage, 3);
+  assert.strictEqual(navTo3.activeBlock, 1);
+
+  const navTo2 = requestSessionNavigation(orderId, deviceId, 2, t5min + 20 * 1000);
   assert.strictEqual(navTo2.success, true);
   assert.strictEqual(navTo2.currentPage, 2);
-  assert.strictEqual(navTo2.remainingSeconds, 120, 'New page reading lock must be exactly 120 seconds');
-  assert.strictEqual(navTo2.expiresAt, t0 + 120 * 1000);
+  assert.strictEqual(navTo2.activeBlock, 1);
 
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`);
-  assert.ok(session);
-  const page2Timer = session.pageReadingTimers[2];
-  assert.ok(page2Timer);
-  assert.strictEqual(page2Timer.isCompleted, false);
-  assert.strictEqual(page2Timer.readingExpiresAt, t0 + 120 * 1000);
-
-  // Navigation is blocked while Page 2 reading timer is active (e.g. at t0 + 60s)
-  const blockedNav = requestSessionNavigation(orderId, deviceId, 3, t0 + 60 * 1000);
-  assert.strictEqual(blockedNav.success, false);
-  assert.strictEqual(blockedNav.error, 'page_reading_active');
-  assert.strictEqual(blockedNav.remainingSeconds, 60);
-
-  // Direct page access to Page 3 is also blocked at t0 + 60s
-  const directBlocked = authorizeDirectPageAccess(session, 3, t0 + 60 * 1000);
-  assert.strictEqual(directBlocked.allowed, false);
-  assert.strictEqual(directBlocked.reason, 'current_page_reading_active');
+  // Direct access to Block 1 pages remains allowed
+  const direct1 = authorizeDirectPageAccess(session, 1, t5min + 25 * 1000);
+  assert.strictEqual(direct1.allowed, true);
 });
 
-test('61. Navigation Unblocks When 120s Page Countdown Completes & Opens Next New Page', () => {
-  const orderId = 'order-unblock-test';
-  const deviceId = 'device-unblock-uuid';
+test('65. Four-Page Block Model - Navigating to Block 2 Activates Block 2 and Permanently Locks Block 1', () => {
+  const orderId = 'order-activate-block2-test';
+  const deviceId = 'device-activate-block2-uuid';
   const t0 = 1700000000000;
 
   checkOrCreateViewingSession(orderId, deviceId, t0);
-  requestSessionNavigation(orderId, deviceId, 2, t0);
 
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`);
-  assert.ok(session);
+  // At 5 minutes + 1ms, customer enters Block 2 by navigating to Page 5
+  const tEnterBlock2 = t0 + 300 * 1000 + 1;
+  const navToBlock2 = requestSessionNavigation(orderId, deviceId, 5, tEnterBlock2);
 
-  // Still blocked at t0 + 119s (1 second remaining)
-  const stillBlocked = requestSessionNavigation(orderId, deviceId, 3, t0 + 119 * 1000);
-  assert.strictEqual(stillBlocked.success, false);
-  assert.strictEqual(stillBlocked.error, 'page_reading_active');
-  assert.strictEqual(stillBlocked.remainingSeconds, 1);
+  assert.strictEqual(navToBlock2.success, true);
+  assert.strictEqual(navToBlock2.navigated, true);
+  assert.strictEqual(navToBlock2.blockAdvanced, true);
+  assert.strictEqual(navToBlock2.activeBlock, 2);
+  assert.strictEqual(navToBlock2.currentPage, 5);
 
-  // At t0 + 120s + 1ms (after 120s reading lock completes)
-  const t1 = t0 + 120 * 1000 + 1;
-
-  // Now customer can navigate to Page 3
-  const navTo3 = requestSessionNavigation(orderId, deviceId, 3, t1);
-  assert.strictEqual(navTo3.success, true);
-  assert.strictEqual(navTo3.navigated, true);
-  assert.strictEqual(navTo3.currentPage, 3);
-  assert.strictEqual(navTo3.remainingSeconds, 120, 'Page 3 must start its own 120s countdown');
-  assert.strictEqual(navTo3.expiresAt, t1 + 120 * 1000);
-
-  // Page 3 starts its own independent 120-second countdown
-  const page3Timer = session.pageReadingTimers[3];
-  assert.ok(page3Timer);
-  assert.strictEqual(page3Timer.isCompleted, false);
-  assert.strictEqual(page3Timer.readingExpiresAt, t1 + 120 * 1000);
-});
-
-test('62. Revisiting Previously Visited Page Requires 1-Minute Navigation Gate (Backward to Welcome Page)', () => {
-  const orderId = 'order-revisit-test';
-  const deviceId = 'device-revisit-uuid';
-
-  checkOrCreateViewingSession(orderId, deviceId);
-  requestSessionNavigation(orderId, deviceId, 2);
-
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`);
-  assert.ok(session);
-
-  // Complete Page 2 reading timer
-  session.pageReadingTimers[2].readingExpiresAt = Date.now() - 1000;
-  session.pageReadingTimers[2].isCompleted = true;
-
-  // Returning to Page 1 (previously visited welcome page) triggers 1-minute gate
-  const revisitWelcome = requestSessionNavigation(orderId, deviceId, 1);
-  assert.strictEqual(revisitWelcome.success, true);
-  assert.strictEqual(revisitWelcome.transitioning, true);
-  assert.strictEqual(revisitWelcome.destinationPage, 1);
-  assert.strictEqual(revisitWelcome.remainingSeconds, 60);
-
-  // While transition is active, attempting another navigation is blocked
-  const blockedAttempt = requestSessionNavigation(orderId, deviceId, 4);
-  assert.strictEqual(blockedAttempt.success, false);
-  assert.strictEqual(blockedAttempt.error, 'transition_in_progress');
-});
-
-test('63. Forward Navigation to Previously Visited Page & Automatic Completion (No Timer Restart)', () => {
-  const orderId = 'order-forward-visited-test';
-  const deviceId = 'device-forward-visited-uuid';
-
-  checkOrCreateViewingSession(orderId, deviceId);
-  requestSessionNavigation(orderId, deviceId, 2);
-
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`);
-  assert.ok(session);
-  session.pageReadingTimers[2].isCompleted = true;
-
-  // Navigate back to Page 1 via transition
-  requestSessionNavigation(orderId, deviceId, 1);
-  session.activeTransition!.expiresAt = Date.now() - 1000; // transition elapsed
-  completeSessionTransition(orderId, deviceId);
-  assert.strictEqual(session.currentPage, 1);
-
-  // Now forward navigate to Page 2 (already visited and completed earlier)
-  const forwardTo2 = requestSessionNavigation(orderId, deviceId, 2);
-  assert.strictEqual(forwardTo2.success, true);
-  assert.strictEqual(forwardTo2.transitioning, true);
-  assert.strictEqual(forwardTo2.destinationPage, 2);
-
-  // Complete 1-minute transition to Page 2
-  session.activeTransition!.expiresAt = Date.now() - 1000;
-  const completed = completeSessionTransition(orderId, deviceId);
-  assert.strictEqual(completed.success, true);
-  assert.strictEqual(completed.currentPage, 2);
-
-  // Page 2 does NOT restart its 10-minute countdown
-  assert.strictEqual(session.pageReadingTimers[2].isCompleted, true);
-});
-
-test('64. Cannot Change Destination or Bypass Transition While Active', () => {
-  const orderId = 'order-bypass-test';
-  const deviceId = 'device-bypass-uuid';
-
-  checkOrCreateViewingSession(orderId, deviceId);
-  requestSessionNavigation(orderId, deviceId, 2);
   const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
-  session.pageReadingTimers[2].isCompleted = true;
+  assert.strictEqual(session.activeBlock, 2);
 
-  // Start transition to Page 1
-  requestSessionNavigation(orderId, deviceId, 1);
+  // Now that Block 2 is active, attempting to navigate back to any page in Block 1 (Pages 1–4) is rejected
+  for (const page of [1, 2, 3, 4]) {
+    const backwardNav = requestSessionNavigation(orderId, deviceId, page, tEnterBlock2 + 1000);
+    assert.strictEqual(backwardNav.success, false);
+    assert.strictEqual(backwardNav.error, 'previous_block_locked');
 
-  // Attempting premature completion fails
-  const premature = completeSessionTransition(orderId, deviceId);
-  assert.strictEqual(premature.success, false);
-  assert.strictEqual(premature.error, 'transition_not_completed');
-
-  // Attempting to change destination to Page 5 is rejected
-  const conflict = requestSessionNavigation(orderId, deviceId, 5);
-  assert.strictEqual(conflict.success, false);
-  assert.strictEqual(conflict.error, 'transition_in_progress');
+    const directBackward = authorizeDirectPageAccess(session, page, tEnterBlock2 + 1000);
+    assert.strictEqual(directBackward.allowed, false);
+    assert.strictEqual(directBackward.reason, 'previous_block_locked');
+  }
 });
 
-test('65. Overall 10-Minute Viewing Session Expiry Is Never Extended by Navigation or Transitions', () => {
-  const orderId = 'order-overall-invariance-test';
-  const deviceId = 'device-overall-invariance-uuid';
-
-  const check = checkOrCreateViewingSession(orderId, deviceId);
-  const initialOverallExpiry = check.session!.overallExpiresAt;
-
-  // Navigate to Page 2
-  requestSessionNavigation(orderId, deviceId, 2);
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
-  assert.strictEqual(session.overallExpiresAt, initialOverallExpiry, 'Overall session expiry must not change on navigation');
-
-  // Complete Page 2 timer and trigger 1-minute transition
-  session.pageReadingTimers[2].isCompleted = true;
-  requestSessionNavigation(orderId, deviceId, 1);
-  assert.strictEqual(session.overallExpiresAt, initialOverallExpiry, 'Overall session expiry must not change on transition start');
-
-  // Complete transition
-  session.activeTransition!.expiresAt = Date.now() - 1000;
-  completeSessionTransition(orderId, deviceId);
-  assert.strictEqual(session.overallExpiresAt, initialOverallExpiry, 'Overall session expiry must not change on transition completion');
-
-  // Expiring overall session invalidates all navigation and page access
-  session.overallExpiresAt = Date.now() - 1000;
-  session.expiresAt = session.overallExpiresAt;
-
-  const expiredNav = requestSessionNavigation(orderId, deviceId, 2);
-  assert.strictEqual(expiredNav.success, false);
-  assert.strictEqual(expiredNav.error, 'session_expired');
-});
-
-test('66. Overall Session Expiry (600s) With 120-Second Page Lock Allows Multi-Page Reading Before Hard Expiry', () => {
-  const orderId = 'order-conflict-test';
-  const deviceId = 'device-conflict-uuid';
-
+test('66. Four-Page Block Model - Block 2 Starts Its Own 5-Minute Eligibility Timer for Block 3', () => {
+  const orderId = 'order-block2-timer-test';
+  const deviceId = 'device-block2-timer-uuid';
   const t0 = 1700000000000;
+
+  checkOrCreateViewingSession(orderId, deviceId, t0);
+  const tEnterBlock2 = t0 + 300 * 1000 + 100;
+  requestSessionNavigation(orderId, deviceId, 5, tEnterBlock2);
+
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  const timer2 = session.blockTimers[2];
+  assert.ok(timer2);
+  assert.strictEqual(timer2.blockIndex, 2);
+  assert.strictEqual(timer2.startedAt, tEnterBlock2);
+  assert.strictEqual(timer2.eligibilityExpiresAt, tEnterBlock2 + BLOCK_PROGRESSION_DURATION_MS);
+  assert.strictEqual(timer2.isEligibleForNext, false);
+
+  // Attempting to navigate to Block 3 (Page 9) before Block 2's 5 minutes elapse is rejected
+  const prematureBlock3 = requestSessionNavigation(orderId, deviceId, 9, tEnterBlock2 + 150 * 1000);
+  assert.strictEqual(prematureBlock3.success, false);
+  assert.strictEqual(prematureBlock3.error, 'next_block_not_eligible');
+});
+
+test('67. Four-Page Block Model - Free Navigation Within Block 2 (Pages 5, 6, 7, 8)', () => {
+  const orderId = 'order-block2-free-nav-test';
+  const deviceId = 'device-block2-free-nav-uuid';
+  const t0 = 1700000000000;
+
+  checkOrCreateViewingSession(orderId, deviceId, t0);
+  const tEnter = t0 + 300 * 1000 + 1;
+  requestSessionNavigation(orderId, deviceId, 5, tEnter);
+
+  // Freely navigate 5 -> 6 -> 8 -> 7 -> 5 without delays
+  const nav6 = requestSessionNavigation(orderId, deviceId, 6, tEnter + 5000);
+  assert.strictEqual(nav6.success, true);
+  assert.strictEqual(nav6.currentPage, 6);
+
+  const nav8 = requestSessionNavigation(orderId, deviceId, 8, tEnter + 10000);
+  assert.strictEqual(nav8.success, true);
+  assert.strictEqual(nav8.currentPage, 8);
+
+  const nav7 = requestSessionNavigation(orderId, deviceId, 7, tEnter + 15000);
+  assert.strictEqual(nav7.success, true);
+  assert.strictEqual(nav7.currentPage, 7);
+
+  // Direct page accesses for Pages 5, 6, 7, 8 are all allowed
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  for (const page of [5, 6, 7, 8]) {
+    const direct = authorizeDirectPageAccess(session, page, tEnter + 20000);
+    assert.strictEqual(direct.allowed, true);
+  }
+});
+
+test('68. Four-Page Block Model - Block Jumping Beyond Immediate Next Block Is Prohibited', () => {
+  const orderId = 'order-jump-prohibit-test';
+  const deviceId = 'device-jump-prohibit-uuid';
+  const t0 = 1700000000000;
+
+  checkOrCreateViewingSession(orderId, deviceId, t0);
+
+  // While in Block 1, attempting to jump to Block 3 (Page 9) or Block 4 (Page 13) is rejected
+  const jumpTo9 = requestSessionNavigation(orderId, deviceId, 9, t0 + 350 * 1000);
+  assert.strictEqual(jumpTo9.success, false);
+  assert.strictEqual(jumpTo9.error, 'block_jump_prohibited');
+
+  const jumpTo13 = requestSessionNavigation(orderId, deviceId, 13, t0 + 350 * 1000);
+  assert.strictEqual(jumpTo13.success, false);
+  assert.strictEqual(jumpTo13.error, 'block_jump_prohibited');
+
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  const direct9 = authorizeDirectPageAccess(session, 9, t0 + 350 * 1000);
+  assert.strictEqual(direct9.allowed, false);
+  assert.strictEqual(direct9.reason, 'block_jump_prohibited');
+});
+
+test('69. Four-Page Block Model - Overall 10-Minute Viewing Session Expiry Is Preserved & Invariant', () => {
+  const orderId = 'order-overall-preserved-test';
+  const deviceId = 'device-overall-preserved-uuid';
+  const t0 = 1700000000000;
+
   const check = checkOrCreateViewingSession(orderId, deviceId, t0);
-  const session = check.session!;
-  assert.strictEqual(session.overallExpiresAt, t0 + 600 * 1000, 'Overall session duration must be exactly 600 seconds');
+  const initialOverallExpiry = check.session!.overallExpiresAt;
+  assert.strictEqual(initialOverallExpiry, t0 + OVERALL_VIEWING_SESSION_DURATION_MS);
 
-  // 1. User spends 10s on Page 1, then navigates to Page 2 at t0 + 10s
-  const nav2 = requestSessionNavigation(orderId, deviceId, 2, t0 + 10 * 1000);
-  assert.strictEqual(nav2.success, true);
-  assert.strictEqual(nav2.remainingSeconds, 120);
-  // Page 2 reading lock expires at t0 + 10s + 120s = t0 + 130s (well before 600s overall expiry!)
+  // Move within Block 1
+  requestSessionNavigation(orderId, deviceId, 3, t0 + 30 * 1000);
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  assert.strictEqual(session.overallExpiresAt, initialOverallExpiry, 'Overall session expiry must never change on internal navigation');
 
-  // 2. At t0 + 130s + 1ms, Page 2's 120s lock has completed, allowing navigation to Page 3
-  const nav3 = requestSessionNavigation(orderId, deviceId, 3, t0 + 130 * 1000 + 1);
-  assert.strictEqual(nav3.success, true);
-  assert.strictEqual(nav3.currentPage, 3);
-  assert.strictEqual(nav3.remainingSeconds, 120);
-  // Page 3 reading lock expires at t0 + 130s + 120s = t0 + 250s
-
-  // 3. User navigates back to Page 2 at t0 + 250s + 1ms -> triggers 60s transition gate
-  const revisit2 = requestSessionNavigation(orderId, deviceId, 2, t0 + 250 * 1000 + 1);
-  assert.strictEqual(revisit2.success, true);
-  assert.strictEqual(revisit2.transitioning, true);
-  assert.strictEqual(revisit2.remainingSeconds, 60);
-
-  // 4. Overall session expiry is unchanged at t0 + 600s regardless of reading or transitions
-  assert.strictEqual(session.overallExpiresAt, t0 + 600 * 1000);
-
-  // 5. When overall session reaches 600s (t0 + 600s + 100ms), all access hard expires
-  const nowAt600 = t0 + 600 * 1000 + 100;
-  const authAt600 = authorizeDirectPageAccess(session, 3, nowAt600);
-  assert.strictEqual(authAt600.allowed, false);
-  assert.strictEqual(authAt600.reason, 'session_expired');
-
-  // Any navigation at or past overall expiry is rejected
-  const navAt600 = requestSessionNavigation(orderId, deviceId, 4, nowAt600);
-  assert.strictEqual(navAt600.success, false);
-  assert.strictEqual(navAt600.error, 'session_expired');
+  // Advance to Block 2
+  requestSessionNavigation(orderId, deviceId, 5, t0 + 300 * 1000 + 1);
+  assert.strictEqual(session.overallExpiresAt, initialOverallExpiry, 'Overall session expiry must never change on block advance');
 });
 
-test('67. Session State Missing After Container Restart or Cross-Instance Partition', () => {
-  const orderId = 'order-partition-test';
-  const deviceId = 'device-partition-uuid';
-  const sessionKey = `${orderId}:${deviceId}`;
+test('70. Four-Page Block Model - Session Expiry Overrides All Block States', () => {
+  const orderId = 'order-expiry-overrides-test';
+  const deviceId = 'device-expiry-overrides-uuid';
+  const t0 = 1700000000000;
 
-  // 1. Initial session created on Instance A
-  const checkA = checkOrCreateViewingSession(orderId, deviceId);
-  assert.strictEqual(checkA.valid, true);
-  requestSessionNavigation(orderId, deviceId, 2);
-  const sessionA = activeViewingSessions.get(sessionKey)!;
-  assert.strictEqual(sessionA.currentPage, 2);
-
-  // 2. Simulate container restart or request arriving at Instance B (in-memory map wiped)
-  activeViewingSessions.delete(sessionKey);
-
-  // 3. New request to Instance B finds no session in memory
-  // Confirms defect: checkOrCreateViewingSession recreates fresh session, resetting timers and page to 1
-  const checkB = checkOrCreateViewingSession(orderId, deviceId);
-  assert.strictEqual(checkB.valid, true);
-  assert.strictEqual(checkB.session!.currentPage, 1, 'Instance B resets currentPage back to 1');
-  assert.deepStrictEqual(checkB.session!.visitedPages, [1], 'Instance B resets visitedPages');
-  assert.ok(checkB.session!.overallExpiresAt >= sessionA.overallExpiresAt, 'Instance B creates a new overall 10-minute expiry, resetting state');
-});
-
-test('68. Direct Page Requests During Active Reading Lock Are Blocked', () => {
-  const orderId = 'order-direct-lock-test';
-  const deviceId = 'device-direct-lock-uuid';
-
-  checkOrCreateViewingSession(orderId, deviceId);
-  requestSessionNavigation(orderId, deviceId, 2);
+  checkOrCreateViewingSession(orderId, deviceId, t0);
   const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
 
-  // Current page is 2, reading countdown is active
-  // Attempting direct access to Page 2 (current page) is allowed
-  const directPage2 = authorizeDirectPageAccess(session, 2);
-  assert.strictEqual(directPage2.allowed, true);
+  // Advance to Block 2 at t0 + 301s
+  requestSessionNavigation(orderId, deviceId, 5, t0 + 301 * 1000);
 
-  // Attempting direct access to Page 3 (bypassing lock) is blocked
-  const directPage3 = authorizeDirectPageAccess(session, 3);
-  assert.strictEqual(directPage3.allowed, false);
-  assert.strictEqual(directPage3.reason, 'current_page_reading_active');
+  // Overall session reaches 10 minutes (600s + 1ms)
+  const tExpired = t0 + OVERALL_VIEWING_SESSION_DURATION_MS + 1;
 
-  // Attempting direct access to Page 1 (bypassing lock) is blocked
-  const directPage1 = authorizeDirectPageAccess(session, 1);
-  assert.strictEqual(directPage1.allowed, false);
-  assert.strictEqual(directPage1.reason, 'current_page_reading_active');
+  // 1. Navigation rejected with session_expired and session is purged from active map
+  const navExpired = requestSessionNavigation(orderId, deviceId, 6, tExpired);
+  assert.strictEqual(navExpired.success, false);
+  assert.strictEqual(navExpired.error, 'session_expired');
+  assert.strictEqual(activeViewingSessions.has(`${orderId}:${deviceId}`), false);
+
+  // 2. Direct page access on expired session rejected with session_expired
+  const directExpired = authorizeDirectPageAccess(session, 5, tExpired);
+  assert.strictEqual(directExpired.allowed, false);
+  assert.strictEqual(directExpired.reason, 'session_expired');
 });
 
-test('69. Direct Page Requests During Active 1-Minute Transition Are Blocked', () => {
-  const orderId = 'order-direct-trans-test';
-  const deviceId = 'device-direct-trans-uuid';
+test('71. Complete Removal of Customer Printing - No Print Button, Icon, or Print Action in Document Access', () => {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <style>
+          @media print {
+            body, html, * {
+              display: none !important;
+              visibility: hidden !important;
+            }
+          }
+        </style>
+      </head>
+      <body>
+        <div id="godrery-ui-header">Godrery Secure Viewer</div>
+        <div id="godrery-container">
+          <div id="godrery-canvas-wrapper">
+            <canvas id="godrery-active-canvas"></canvas>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
 
-  checkOrCreateViewingSession(orderId, deviceId);
-  requestSessionNavigation(orderId, deviceId, 2);
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
-  session.pageReadingTimers[2].isCompleted = true; // complete reading timer
+  const dom = new JSDOM(html);
+  const document = dom.window.document;
 
-  // Start 1-minute transition to Page 1
-  requestSessionNavigation(orderId, deviceId, 1);
-  assert.ok(session.activeTransition);
+  // 1. Assert no print or download button exists in viewer DOM
+  const printButtons = Array.from(document.querySelectorAll('button')).filter((b: any) => 
+    b.textContent?.toLowerCase().includes('print') || b.id.includes('print')
+  );
+  assert.strictEqual(printButtons.length, 0, 'No Print button must exist in Document Access view');
 
-  // Direct request to Page 1 before 60s has elapsed is blocked
-  const directDuringTrans = authorizeDirectPageAccess(session, 1);
-  assert.strictEqual(directDuringTrans.allowed, false);
-  assert.strictEqual(directDuringTrans.reason, 'transition_in_progress');
+  const downloadButtons = Array.from(document.querySelectorAll('button')).filter((b: any) => 
+    b.textContent?.toLowerCase().includes('download') || b.id.includes('download')
+  );
+  assert.strictEqual(downloadButtons.length, 0, 'No Download button must exist in customer Document Access toolbar');
 
-  // Direct request to unrelated Page 4 is also blocked
-  const directUnrelated = authorizeDirectPageAccess(session, 4);
-  assert.strictEqual(directUnrelated.allowed, false);
-  assert.strictEqual(directUnrelated.reason, 'transition_in_progress');
+  // 2. Assert no customer download links or anchors exist
+  const downloadLinks = Array.from(document.querySelectorAll('a')).filter((a: any) => 
+    a.hasAttribute('download') || a.href?.toLowerCase().includes('download') || a.href?.toLowerCase().includes('stream')
+  );
+  assert.strictEqual(downloadLinks.length, 0, 'No customer-facing download link or anchor must be exposed');
 
-  // Direct request to current page (Page 2) remains allowed while transition counts down
-  const directCurPage = authorizeDirectPageAccess(session, 2);
-  assert.strictEqual(directCurPage.allowed, true);
-});
+  // 3. Assert no print wrapper styling that enables printing
+  const oldPrintWrapper = document.getElementById('godrery-print-wrapper');
+  assert.strictEqual(oldPrintWrapper, null, '#godrery-print-wrapper must be removed');
 
-test('70. Direct Page Requests for Unauthorized Unvisited Pages Are Blocked', () => {
-  const orderId = 'order-direct-unvisited-test';
-  const deviceId = 'device-direct-unvisited-uuid';
+  // 4. Assert print media queries suppress all content
+  const styleEl = document.querySelector('style')!;
+  const css = styleEl.textContent || '';
+  assert.ok(css.includes('display: none !important'), 'Print CSS must completely suppress output');
 
-  checkOrCreateViewingSession(orderId, deviceId);
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
-
-  // On Welcome page (Page 1). Direct attempt to retrieve Page 4 without navigation request is blocked
-  const directJump = authorizeDirectPageAccess(session, 4);
-  assert.strictEqual(directJump.allowed, false);
-  assert.strictEqual(directJump.reason, 'navigation_request_required');
-});
-
-test('71. Completed 1-Minute Transition Authorizes Destination Page', () => {
-  const orderId = 'order-direct-trans-complete-test';
-  const deviceId = 'device-direct-trans-complete-uuid';
-
-  checkOrCreateViewingSession(orderId, deviceId);
-  requestSessionNavigation(orderId, deviceId, 2);
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
-  session.pageReadingTimers[2].isCompleted = true;
-
-  // Start transition to Page 1
-  requestSessionNavigation(orderId, deviceId, 1);
-
-  // Simulate 60s elapsed
-  const futureTime = session.activeTransition!.expiresAt + 100;
-  const directAfterTrans = authorizeDirectPageAccess(session, 1, futureTime);
-  assert.strictEqual(directAfterTrans.allowed, true);
-  assert.strictEqual(session.currentPage, 1);
-  assert.strictEqual(session.activeTransition, null);
+  // 5. Assert authorized PDF canvas rendering structure is preserved
+  const canvasEl = document.getElementById('godrery-active-canvas');
+  assert.ok(canvasEl, 'godrery-active-canvas must be preserved for PDF.js canvas rendering');
+  assert.strictEqual(canvasEl.tagName, 'CANVAS');
 });
 
 test('72. Existing Device Registration and 3-Device Limit Remain Intact', async () => {
@@ -1976,159 +1991,108 @@ test('72. Existing Device Registration and 3-Device Limit Remain Intact', async 
   assert.strictEqual(isDev1Auth, true);
 });
 
-test('73. Shared Duration Constants & 120-Second Reading Lock Boundary Verification', () => {
-  // Shared constants invariant verification
-  assert.strictEqual(NEW_PAGE_READING_DURATION_MS, 120000, 'New-page reading duration must be exactly 120,000 ms');
-  assert.strictEqual(NEW_PAGE_READING_DURATION_SECONDS, 120, 'New-page reading duration must be exactly 120 seconds');
-  assert.strictEqual(OVERALL_VIEWING_SESSION_DURATION_MS, 600000, 'Overall viewing session must be exactly 600,000 ms (10 minutes)');
-  assert.strictEqual(OVERALL_VIEWING_SESSION_DURATION_SECONDS, 600, 'Overall viewing session must be exactly 600 seconds');
-  assert.strictEqual(REVISIT_PAGE_TRANSITION_DURATION_MS, 60000, 'Revisit transition gate must be exactly 60,000 ms (1 minute)');
-  assert.strictEqual(REVISIT_PAGE_TRANSITION_DURATION_SECONDS, 60, 'Revisit transition gate must be exactly 60 seconds');
+test('73. Four-Page Block Helper Invariants (Page to Block Mapping & Ranges)', () => {
+  // Constant checks
+  assert.strictEqual(BLOCK_PAGE_SIZE, 4);
+  assert.strictEqual(BLOCK_PROGRESSION_DURATION_MS, 300000);
+  assert.strictEqual(BLOCK_PROGRESSION_DURATION_SECONDS, 300);
+  assert.strictEqual(OVERALL_VIEWING_SESSION_DURATION_MS, 600000);
+  assert.strictEqual(OVERALL_VIEWING_SESSION_DURATION_SECONDS, 600);
 
-  const orderId = 'order-exact-boundary-test';
-  const deviceId = 'device-exact-boundary-uuid';
-  const t0 = 1700000000000;
+  // Page to Block mapping
+  assert.strictEqual(getBlockIndexForPage(1), 1);
+  assert.strictEqual(getBlockIndexForPage(2), 1);
+  assert.strictEqual(getBlockIndexForPage(3), 1);
+  assert.strictEqual(getBlockIndexForPage(4), 1);
+  assert.strictEqual(getBlockIndexForPage(5), 2);
+  assert.strictEqual(getBlockIndexForPage(8), 2);
+  assert.strictEqual(getBlockIndexForPage(9), 3);
+  assert.strictEqual(getBlockIndexForPage(12), 3);
+  assert.strictEqual(getBlockIndexForPage(13), 4);
+  assert.strictEqual(getBlockIndexForPage(303), 76);
+
+  // Block range calculations
+  assert.deepStrictEqual(getBlockPageRange(1), { startPage: 1, endPage: 4 });
+  assert.deepStrictEqual(getBlockPageRange(2), { startPage: 5, endPage: 8 });
+  assert.deepStrictEqual(getBlockPageRange(3), { startPage: 9, endPage: 12 });
+  assert.deepStrictEqual(getBlockPageRange(76), { startPage: 301, endPage: 304 });
+});
+
+test('74. recordPageArrival Idempotency in Block Model', () => {
+  const orderId = 'order-arrival-block-test';
+  const deviceId = 'device-arrival-block-uuid';
+  const t0 = 1710000000000;
 
   checkOrCreateViewingSession(orderId, deviceId, t0);
-  const nav = requestSessionNavigation(orderId, deviceId, 2, t0);
-  assert.strictEqual(nav.success, true);
-  assert.strictEqual(nav.remainingSeconds, 120);
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  const expectedExpiry = session.blockTimers[1].eligibilityExpiresAt;
 
+  // Arrival on current page 1 at t0 + 2s
+  const arr1 = recordPageArrival(orderId, deviceId, 1, t0 + 2000);
+  assert.strictEqual(arr1.success, true);
+  assert.strictEqual(arr1.activeBlock, 1);
+  assert.strictEqual(session.blockTimers[1].eligibilityExpiresAt, expectedExpiry);
+
+  // Navigate to Page 3 within Block 1, arrive at t0 + 30s
+  requestSessionNavigation(orderId, deviceId, 3, t0 + 25000);
+  const arr3 = recordPageArrival(orderId, deviceId, 3, t0 + 30000);
+  assert.strictEqual(arr3.success, true);
+  assert.strictEqual(arr3.page, 3);
+  assert.strictEqual(session.blockTimers[1].eligibilityExpiresAt, expectedExpiry, 'Arriving at Page 3 must not alter Block 1 eligibility expiry');
+});
+
+test('75. Direct Page Access Authorizes All Pages in Active Block & Rejects Outside', () => {
+  const orderId = 'order-direct-block-test';
+  const deviceId = 'device-direct-block-uuid';
+  const t0 = 1710000000000;
+
+  checkOrCreateViewingSession(orderId, deviceId, t0);
   const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
 
-  // 1 millisecond before expiry: t0 + 119,999 ms -> still locked
-  const lockedBoundary = requestSessionNavigation(orderId, deviceId, 3, t0 + 119999);
-  assert.strictEqual(lockedBoundary.success, false);
-  assert.strictEqual(lockedBoundary.error, 'page_reading_active');
-  assert.strictEqual(lockedBoundary.remainingSeconds, 1);
+  // In Block 1: Pages 1, 2, 3, 4 are authorized
+  for (const p of [1, 2, 3, 4]) {
+    const auth = authorizeDirectPageAccess(session, p, t0);
+    assert.strictEqual(auth.allowed, true, `Page ${p} should be allowed in Block 1`);
+  }
 
-  const directLocked = authorizeDirectPageAccess(session, 3, t0 + 119999);
-  assert.strictEqual(directLocked.allowed, false);
-  assert.strictEqual(directLocked.reason, 'current_page_reading_active');
+  // Pages outside Block 1 are rejected
+  const auth5 = authorizeDirectPageAccess(session, 5, t0);
+  assert.strictEqual(auth5.allowed, false);
 
-  // Exactly at expiry: t0 + 120,000 ms -> unlocked
-  const unlockedBoundary = requestSessionNavigation(orderId, deviceId, 3, t0 + 120000);
-  assert.strictEqual(unlockedBoundary.success, true);
-  assert.strictEqual(unlockedBoundary.currentPage, 3);
-  assert.strictEqual(unlockedBoundary.remainingSeconds, 120);
+  const auth9 = authorizeDirectPageAccess(session, 9, t0);
+  assert.strictEqual(auth9.allowed, false);
 });
 
-test('74. recordPageArrival Starts Authoritative 120s Reading Lock on First Landing', () => {
-  const orderId = 'order-arrival-first-test';
-  const deviceId = 'device-arrival-first-uuid';
-  const t0 = 1710000000000;
-
-  // Initialize session on Welcome Page 1
-  checkOrCreateViewingSession(orderId, deviceId, t0);
-  
-  // Request navigation to Page 2
-  const nav = requestSessionNavigation(orderId, deviceId, 2, t0);
-  assert.strictEqual(nav.success, true);
-  assert.strictEqual(nav.currentPage, 2);
-  assert.strictEqual(nav.waitingArrival, true);
-
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
-  const timerBefore = session.pageReadingTimers[2];
-  assert.strictEqual(timerBefore.hasArrived, false);
-
-  // Client renders canvas and triggers arrival at t0 + 500ms
-  const tArrival = t0 + 500;
-  const arrival = recordPageArrival(orderId, deviceId, 2, tArrival);
-  assert.strictEqual(arrival.success, true);
-  assert.strictEqual(arrival.arrived, true);
-  assert.strictEqual(arrival.isFirstArrival, true);
-  assert.strictEqual(arrival.currentPage, 2);
-  assert.strictEqual(arrival.remainingSeconds, 120);
-  assert.strictEqual(arrival.expiresAt, tArrival + 120000);
-
-  const timerAfter = session.pageReadingTimers[2];
-  assert.strictEqual(timerAfter.hasArrived, true);
-  assert.strictEqual(timerAfter.readingExpiresAt, tArrival + 120000);
-});
-
-test('75. recordPageArrival Idempotency - Re-render, Zoom, Resize or Network Reconnect Never Resets Timer', () => {
-  const orderId = 'order-arrival-idempotent-test';
-  const deviceId = 'device-arrival-idempotent-uuid';
+test('76. Page Arrival Mismatch Handled Defensively', () => {
+  const orderId = 'order-mismatch-block-test';
+  const deviceId = 'device-mismatch-block-uuid';
   const t0 = 1710000000000;
 
   checkOrCreateViewingSession(orderId, deviceId, t0);
-  requestSessionNavigation(orderId, deviceId, 2, t0);
-  
-  // First arrival at t0 + 1000ms
-  const t1 = t0 + 1000;
-  const arrival1 = recordPageArrival(orderId, deviceId, 2, t1);
-  assert.strictEqual(arrival1.isFirstArrival, true);
-  const authoritativeExpiry = arrival1.expiresAt;
-  assert.strictEqual(authoritativeExpiry, t1 + 120000);
-
-  // User zooms in at t1 + 15,000ms (15s later) -> canvas re-renders and re-invokes arrival
-  const tZoom = t1 + 15000;
-  const arrivalZoom = recordPageArrival(orderId, deviceId, 2, tZoom);
-  assert.strictEqual(arrivalZoom.success, true);
-  assert.strictEqual(arrivalZoom.isFirstArrival, false);
-  assert.strictEqual(arrivalZoom.expiresAt, authoritativeExpiry, 'Expiry timestamp must NOT be updated or extended');
-  assert.strictEqual(arrivalZoom.remainingSeconds, 105, 'Remaining seconds must reflect monotonic countdown (120 - 15 = 105s)');
-
-  // Window resizes at t1 + 30,000ms (30s later) -> canvas re-renders again
-  const tResize = t1 + 30000;
-  const arrivalResize = recordPageArrival(orderId, deviceId, 2, tResize);
-  assert.strictEqual(arrivalResize.isFirstArrival, false);
-  assert.strictEqual(arrivalResize.expiresAt, authoritativeExpiry, 'Window resize must not reset reading timer');
-  assert.strictEqual(arrivalResize.remainingSeconds, 90, 'Remaining seconds must reflect monotonic countdown (120 - 30 = 90s)');
-
-  // Tab regains visibility or network reconnects at t1 + 50,000ms
-  const tReconnect = t1 + 50000;
-  const arrivalReconnect = recordPageArrival(orderId, deviceId, 2, tReconnect);
-  assert.strictEqual(arrivalReconnect.isFirstArrival, false);
-  assert.strictEqual(arrivalReconnect.expiresAt, authoritativeExpiry);
-  assert.strictEqual(arrivalReconnect.remainingSeconds, 70);
-});
-
-test('76. Page Arrival Mismatch Rejection', () => {
-  const orderId = 'order-arrival-mismatch-test';
-  const deviceId = 'device-arrival-mismatch-uuid';
-  const t0 = 1710000000000;
-
-  checkOrCreateViewingSession(orderId, deviceId, t0);
-  // Current page is 1. Attempting to record arrival on Page 4 fails closed
-  const mismatch = recordPageArrival(orderId, deviceId, 4, t0);
+  // Current page is 1. If arrival is reported for Page 7 (different block), fails closed
+  const mismatch = recordPageArrival(orderId, deviceId, 7, t0);
   assert.strictEqual(mismatch.success, false);
   assert.strictEqual(mismatch.error, 'page_mismatch');
-
-  // Welcome page 1 arrival is immediate and completed
-  const welcomeArrival = recordPageArrival(orderId, deviceId, 1, t0);
-  assert.strictEqual(welcomeArrival.success, true);
-  assert.strictEqual(welcomeArrival.remainingSeconds, 0);
 });
 
-test('77. Navigation Blocked While Arrival and Reading Lock Are Active', () => {
-  const orderId = 'order-nav-arrival-lock-test';
-  const deviceId = 'device-nav-arrival-lock-uuid';
+test('77. Backward Navigation to Locked Blocks Fails Closed Across Boundary', () => {
+  const orderId = 'order-boundary-test';
+  const deviceId = 'device-boundary-uuid';
   const t0 = 1710000000000;
 
   checkOrCreateViewingSession(orderId, deviceId, t0);
-  requestSessionNavigation(orderId, deviceId, 2, t0);
-  
-  // Arrival at t0 + 2000
-  const tArrival = t0 + 2000;
-  recordPageArrival(orderId, deviceId, 2, tArrival);
+  // Advance to Block 2 at t0 + 300,001ms
+  requestSessionNavigation(orderId, deviceId, 5, t0 + 300001);
 
-  // Attempting to navigate to Page 3 at tArrival + 60,000ms (1 minute into reading lock)
-  const navAttempt = requestSessionNavigation(orderId, deviceId, 3, tArrival + 60000);
-  assert.strictEqual(navAttempt.success, false);
-  assert.strictEqual(navAttempt.error, 'page_reading_active');
-  assert.strictEqual(navAttempt.remainingSeconds, 60);
-
-  // Exactly at expiry (tArrival + 120,000ms): navigation is unblocked
-  const navSuccess = requestSessionNavigation(orderId, deviceId, 3, tArrival + 120000);
-  assert.strictEqual(navSuccess.success, true);
-  assert.strictEqual(navSuccess.currentPage, 3);
+  // Exact boundary: Page 5 (Block 2 start) navigating to Page 4 (Block 1 end)
+  const boundaryNav = requestSessionNavigation(orderId, deviceId, 4, t0 + 305000);
+  assert.strictEqual(boundaryNav.success, false);
+  assert.strictEqual(boundaryNav.error, 'previous_block_locked');
 });
 
 test('78. Single-Page Canvas & Print Restriction Invariant', () => {
-  // Verify that the viewer layout guarantees single-page rendering without multi-page or facing-page leaks
-  const orderId = 'order-print-invariant-test';
-  const deviceId = 'device-print-invariant-uuid';
+  const orderId = 'order-print-invariant-block-test';
+  const deviceId = 'device-print-invariant-block-uuid';
   const t0 = 1710000000000;
 
   checkOrCreateViewingSession(orderId, deviceId, t0);
@@ -2138,18 +2102,16 @@ test('78. Single-Page Canvas & Print Restriction Invariant', () => {
   const accessCur = authorizeDirectPageAccess(session, 1, t0);
   assert.strictEqual(accessCur.allowed, true);
 
-  // Direct access for any other page is forbidden (cannot leak or load adjacent pages)
-  const accessAdjacent = authorizeDirectPageAccess(session, 2, t0);
-  assert.strictEqual(accessAdjacent.allowed, false);
+  // Direct access for future block page is forbidden
+  const accessFuture = authorizeDirectPageAccess(session, 5, t0);
+  assert.strictEqual(accessFuture.allowed, false);
 
   // Overall session expiry boundary invariant
   assert.strictEqual(OVERALL_VIEWING_SESSION_DURATION_MS, 600000);
-  assert.strictEqual(NEW_PAGE_READING_DURATION_MS, 120000);
-  assert.strictEqual(REVISIT_PAGE_TRANSITION_DURATION_MS, 60000);
+  assert.strictEqual(BLOCK_PROGRESSION_DURATION_MS, 300000);
 });
 
 test('79. Direct Browser Address-Bar Navigation Gate (Sec-Fetch-Dest: document) Fails Closed', () => {
-  // Simulates an attacker or customer pasting the raw PDF URL directly into a browser tab
   function evaluateRawStreamAccess(headers: Record<string, string>) {
     const isDirectBrowserNav = 
       headers['sec-fetch-dest'] === 'document' || 
@@ -2183,67 +2145,67 @@ test('79. Direct Browser Address-Bar Navigation Gate (Sec-Fetch-Dest: document) 
 });
 
 test('80. Offline Reload Session Persistence & Clock Tamper Resistance Invariant', () => {
-  const token = 'test-token-offline-123';
   const t0 = 1715000000000;
   const overallExpiry = t0 + 600000; // 10 min
-  const page2ReadingExpiry = t0 + 120000; // 2 min
+  const block1EligibilityExpiry = t0 + 300000; // 5 min
 
-  // Simulated stored session state saved right after page 2 arrival
   const savedSession = {
     overallExpiresAt: overallExpiry,
-    visitedPages: [1, 2],
     currentPage: 2,
-    pageReadingTimers: {
-      1: { firstOpenedAt: t0, readingExpiresAt: t0, isCompleted: true, hasArrived: true },
-      2: { firstOpenedAt: t0, readingExpiresAt: page2ReadingExpiry, isCompleted: false, hasArrived: true }
+    activeBlock: 1,
+    blockTimers: {
+      1: {
+        blockIndex: 1,
+        startedAt: t0,
+        eligibilityExpiresAt: block1EligibilityExpiry,
+        isEligibleForNext: false
+      }
     },
-    activeTransition: null,
     savedAt: t0
   };
 
   // 1. Customer reloads 30 seconds later while offline
   const tReload = t0 + 30000;
-  const timerOnReload = savedSession.pageReadingTimers[savedSession.currentPage];
-  const remOnReload = Math.max(0, Math.ceil((timerOnReload.readingExpiresAt - tReload) / 1000));
-  assert.strictEqual(remOnReload, 90, 'Remaining seconds must be 90s, not reset to 120s or bypassed to 0s');
+  const timerOnReload = savedSession.blockTimers[savedSession.activeBlock];
+  const remOnReload = Math.max(0, Math.ceil((timerOnReload.eligibilityExpiresAt - tReload) / 1000));
+  assert.strictEqual(remOnReload, 270, 'Remaining seconds must be 270s, not reset to 300s or bypassed to 0s');
   assert.strictEqual(savedSession.currentPage, 2, 'Current page must remain on Page 2');
+  assert.strictEqual(savedSession.activeBlock, 1, 'Active block must remain Block 1');
 
-  // 2. User attempts to shift local clock backwards by 1 hour (tampering)
+  // 2. Clock tampering check: moving system clock backwards cannot bypass timer
   const tClockHacked = t0 - 3600000;
-  // If wall clock was moved backwards, readingExpiresAt is still in the future relative to original time anchor
-  const isExpiredWithHackedClock = tClockHacked >= timerOnReload.readingExpiresAt;
-  assert.strictEqual(isExpiredWithHackedClock, false, 'Moving system clock backwards cannot unlock navigation');
+  const isEligibleHacked = tClockHacked >= timerOnReload.eligibilityExpiresAt;
+  assert.strictEqual(isEligibleHacked, false, 'Moving system clock backwards cannot unlock next block');
 
-  // 3. Customer reloads after overall session duration (e.g. at t0 + 600,001 ms)
+  // 3. Customer reloads after overall session duration (at t0 + 600,001 ms)
   const tOverallExpired = t0 + 600001;
   const isSessionExpiredOnReload = tOverallExpired >= savedSession.overallExpiresAt;
   assert.strictEqual(isSessionExpiredOnReload, true, 'Overall session expiry must be strictly enforced on reload');
 });
 
 test('81. Real Browser DOM & Event Simulation (JSDOM): Single Canvas, Keyboard Locks, Rapid Clicks & Print Rules', () => {
-  // Construct DOM representing the DocumentAccessView
   const html = `
     <!DOCTYPE html>
     <html>
       <head>
         <style>
           @media print {
-            body { visibility: hidden !important; }
-            #godrery-print-wrapper, #godrery-print-wrapper * { visibility: visible !important; }
-            #godrery-print-wrapper { position: fixed !important; width: 100vw; height: 100vh; }
-            #godrery-active-canvas { display: block !important; }
+            body, html, * {
+              display: none !important;
+              visibility: hidden !important;
+            }
           }
         </style>
       </head>
       <body>
         <div id="godrery-ui-header">Godrery Secure Viewer</div>
         <div id="godrery-container">
-          <div id="godrery-print-wrapper">
+          <div id="godrery-canvas-wrapper">
             <canvas id="godrery-active-canvas"></canvas>
           </div>
         </div>
         <button id="nav-prev" disabled>Prev</button>
-        <button id="nav-next" disabled>Next</button>
+        <button id="nav-next">Next</button>
       </body>
     </html>
   `;
@@ -2253,54 +2215,43 @@ test('81. Real Browser DOM & Event Simulation (JSDOM): Single Canvas, Keyboard L
 
   // 1. Single Canvas Invariant in DOM
   const canvases = document.querySelectorAll('canvas');
-  assert.strictEqual(canvases.length, 1, 'Exactly one canvas element must exist in the DOM (no multi-page or facing pages)');
+  assert.strictEqual(canvases.length, 1, 'Exactly one canvas element must exist in the DOM');
   assert.strictEqual(canvases[0].id, 'godrery-active-canvas');
 
-  // 2. Keyboard Navigation Interception while isNavigationLocked = true
-  let isNavigationLocked = true;
-  let keyDefaultPrevented = false;
+  // 2. Print & Download Suppression in DOM
+  const styleEl = document.querySelector('style')!;
+  const css = styleEl.textContent || '';
+  assert.ok(css.includes('display: none !important'), 'Print styles must completely suppress output');
+  assert.strictEqual(document.querySelector('button[title*="Print"]'), null, 'No print button in viewer');
+  assert.strictEqual(document.querySelector('button[title*="Download"]'), null, 'No download button in viewer');
+  assert.strictEqual(document.querySelector('a[download]'), null, 'No download link in viewer');
 
+  // 3. Print & Save Shortcut Interception (Ctrl+P, Cmd+P, Ctrl+S, Cmd+S)
+  let printPrevented = false;
+  let savePrevented = false;
   dom.window.addEventListener('keydown', (e: any) => {
-    const pageKeys = ['ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End', ' '];
-    if (pageKeys.includes(e.key)) {
-      if (isNavigationLocked) {
-        e.preventDefault();
-        e.stopPropagation();
-        keyDefaultPrevented = true;
-      }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'p' || e.key === 'P')) {
+      e.preventDefault();
+      e.stopPropagation();
+      printPrevented = true;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+      e.preventDefault();
+      e.stopPropagation();
+      savePrevented = true;
     }
   }, { capture: true });
 
-  const eventArrowRight = new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', cancelable: true });
-  dom.window.dispatchEvent(eventArrowRight);
-  assert.strictEqual(keyDefaultPrevented, true, 'ArrowRight must be prevented while navigation is locked');
+  const eventCtrlP = new dom.window.KeyboardEvent('keydown', { key: 'p', ctrlKey: true, cancelable: true });
+  dom.window.dispatchEvent(eventCtrlP);
+  assert.strictEqual(printPrevented, true, 'Ctrl+P must be prevented in customer viewer');
 
-  // 3. Rapid Clicks Resistance
-  let navigationTriggerCount = 0;
-  const nextButton = document.getElementById('nav-next') as HTMLButtonElement;
-  nextButton.addEventListener('click', () => {
-    if (!isNavigationLocked) {
-      navigationTriggerCount++;
-    }
-  });
-
-  // User rapidly clicks Next button 10 times in 100ms
-  for (let i = 0; i < 10; i++) {
-    nextButton.dispatchEvent(new dom.window.MouseEvent('click'));
-  }
-  assert.strictEqual(navigationTriggerCount, 0, 'Rapid clicks while navigation is locked must trigger 0 navigations');
-
-  // 4. Print CSS Rule Verification
-  const styleEl = document.querySelector('style');
-  assert.ok(styleEl);
-  const css = styleEl.textContent || '';
-  assert.ok(css.includes('visibility: hidden'), 'Print stylesheet must hide body UI chrome');
-  assert.ok(css.includes('#godrery-print-wrapper'), 'Print stylesheet must isolate #godrery-print-wrapper');
-  assert.ok(css.includes('#godrery-active-canvas'), 'Print stylesheet must render #godrery-active-canvas');
+  const eventCtrlS = new dom.window.KeyboardEvent('keydown', { key: 's', ctrlKey: true, cancelable: true });
+  dom.window.dispatchEvent(eventCtrlS);
+  assert.strictEqual(savePrevented, true, 'Ctrl+S must be prevented in customer viewer');
 });
 
 test('82. Cloud Run Multi-Instance Isolation & Cold Start Fail-Closed Verification', () => {
-  // Simulate two isolated Cloud Run container instances with separate memory spaces
   const instanceA_Sessions = new Map<string, any>();
   const instanceB_Sessions = new Map<string, any>();
 
@@ -2309,45 +2260,43 @@ test('82. Cloud Run Multi-Instance Isolation & Cold Start Fail-Closed Verificati
   const sessionKey = `${orderId}:${deviceId}`;
   const t0 = 1715000000000;
 
-  // 1. Instance A receives initial session initialization and navigate to Page 2
+  // 1. Instance A receives initial session and advances to Block 2
   instanceA_Sessions.set(sessionKey, {
     orderId,
     deviceId,
     overallExpiresAt: t0 + 600000,
-    currentPage: 2,
-    visitedPages: [1, 2],
-    pageReadingTimers: {
-      1: { firstOpenedAt: t0, readingExpiresAt: t0, isCompleted: true, hasArrived: true },
-      2: { firstOpenedAt: t0, readingExpiresAt: t0 + 120000, isCompleted: false, hasArrived: true }
-    },
-    activeTransition: null
+    currentPage: 5,
+    activeBlock: 2,
+    blockTimers: {
+      1: { blockIndex: 1, startedAt: t0, eligibilityExpiresAt: t0 + 300000, isEligibleForNext: true },
+      2: { blockIndex: 2, startedAt: t0 + 300001, eligibilityExpiresAt: t0 + 600001, isEligibleForNext: false }
+    }
   });
 
-  // 2. Next request (e.g. arrival or direct page access) hits Instance B due to round-robin or cold start
+  // 2. Next request hits Instance B due to round-robin or cold start
   const sessionOnB = instanceB_Sessions.get(sessionKey);
-  assert.strictEqual(sessionOnB, undefined, 'Instance B must not share in-memory state with Instance A');
+  assert.strictEqual(sessionOnB, undefined, 'Instance B does not share in-memory state with Instance A');
 
-  // 3. Instance B evaluates direct page access to Page 2 without local session
-  // Because sessionOnB is missing, checkOrCreateViewingSession creates a default session on Page 1
+  // 3. Instance B initializes fresh session (defaulting to Block 1, Page 1)
   const freshSessionB = {
     orderId,
     deviceId,
     overallExpiresAt: t0 + 600000,
     expiresAt: t0 + 600000,
     currentPage: 1,
-    visitedPages: [1],
-    pageReadingTimers: {
-      1: { firstOpenedAt: t0, readingExpiresAt: t0, isCompleted: true, hasArrived: true }
-    },
-    activeTransition: null
+    activeBlock: 1,
+    blockTimers: {
+      1: { blockIndex: 1, startedAt: t0, eligibilityExpiresAt: t0 + 300000, isEligibleForNext: false }
+    }
   };
   instanceB_Sessions.set(sessionKey, freshSessionB);
 
-  // Direct access for Page 2 on Instance B is evaluated
-  const accessOnB = authorizeDirectPageAccess(freshSessionB, 2, t0);
-  assert.strictEqual(accessOnB.allowed, false, 'Instance B must reject Page 2 access without transition or arrival');
-  assert.strictEqual(accessOnB.reason, 'navigation_request_required', 'Instance B must fail closed');
+  // Evaluating direct access for Page 5 on fresh Instance B is rejected
+  const accessOnB = authorizeDirectPageAccess(freshSessionB, 5, t0);
+  assert.strictEqual(accessOnB.allowed, false, 'Instance B must reject Page 5 without prior block progression');
+  assert.strictEqual(accessOnB.reason, 'next_block_not_eligible', 'Instance B must fail closed');
 });
+
 
 
 

@@ -4270,27 +4270,38 @@ app.post("/api/document/register-device", async (req, res) => {
     }
 });
 
-// Viewing Session & Per-Page Reading Management Constants
+// Viewing Session & Four-Page Block Reading Management Constants
 export const OVERALL_VIEWING_SESSION_DURATION_MS = 10 * 60 * 1000; // 600,000 ms (10 minutes)
 export const OVERALL_VIEWING_SESSION_DURATION_SECONDS = 600;
 
-export const NEW_PAGE_READING_DURATION_MS = 2 * 60 * 1000; // 120,000 ms (2 minutes)
-export const NEW_PAGE_READING_DURATION_SECONDS = 120;
+export const BLOCK_PROGRESSION_DURATION_MS = 5 * 60 * 1000; // 300,000 ms (5 minutes)
+export const BLOCK_PROGRESSION_DURATION_SECONDS = 300;
 
-export const REVISIT_PAGE_TRANSITION_DURATION_MS = 60 * 1000; // 60,000 ms (1 minute)
+export const BLOCK_PAGE_SIZE = 4;
+
+// Backward-compatibility aliases
+export const NEW_PAGE_READING_DURATION_MS = BLOCK_PROGRESSION_DURATION_MS;
+export const NEW_PAGE_READING_DURATION_SECONDS = BLOCK_PROGRESSION_DURATION_SECONDS;
+export const REVISIT_PAGE_TRANSITION_DURATION_MS = 60 * 1000;
 export const REVISIT_PAGE_TRANSITION_DURATION_SECONDS = 60;
 
-export interface PageReadingTimer {
-  firstOpenedAt: number;
-  readingExpiresAt: number;
-  isCompleted: boolean;
-  hasArrived?: boolean;
+export function getBlockIndexForPage(page: number): number {
+  if (!Number.isInteger(page) || page < 1) return 1;
+  return Math.floor((page - 1) / BLOCK_PAGE_SIZE) + 1;
 }
 
-export interface NavigationTransition {
-  destinationPage: number;
+export function getBlockPageRange(blockIndex: number): { startPage: number; endPage: number } {
+  const safeBlock = Math.max(1, blockIndex);
+  const startPage = (safeBlock - 1) * BLOCK_PAGE_SIZE + 1;
+  const endPage = safeBlock * BLOCK_PAGE_SIZE;
+  return { startPage, endPage };
+}
+
+export interface BlockTimerState {
+  blockIndex: number;
   startedAt: number;
-  expiresAt: number;
+  eligibilityExpiresAt: number;
+  isEligibleForNext: boolean;
 }
 
 export interface ViewingSessionData {
@@ -4299,9 +4310,8 @@ export interface ViewingSessionData {
   overallExpiresAt: number;
   expiresAt: number; // alias for overallExpiresAt for backwards compatibility
   currentPage: number;
-  visitedPages: number[];
-  pageReadingTimers: Record<number, PageReadingTimer>;
-  activeTransition: NavigationTransition | null;
+  activeBlock: number;
+  blockTimers: Record<number, BlockTimerState>;
 }
 
 export const activeViewingSessions = new Map<string, ViewingSessionData>();
@@ -4323,9 +4333,10 @@ export function checkOrCreateViewingSession(orderId: string, deviceId: string, n
       activeViewingSessions.delete(sessionKey);
       return { valid: false, remainingSeconds: 0, session: null };
     }
-    const curTimer = existing.pageReadingTimers[existing.currentPage];
-    if (curTimer && !curTimer.isCompleted && now >= curTimer.readingExpiresAt) {
-      curTimer.isCompleted = true;
+    // Update block eligibility status if block timer has completed
+    const curBlockTimer = existing.blockTimers[existing.activeBlock];
+    if (curBlockTimer && !curBlockTimer.isEligibleForNext && now >= curBlockTimer.eligibilityExpiresAt) {
+      curBlockTimer.isEligibleForNext = true;
     }
     const remainingSeconds = Math.max(0, Math.floor((overallExpiry - now) / 1000));
     return { valid: true, remainingSeconds, session: existing };
@@ -4337,16 +4348,15 @@ export function checkOrCreateViewingSession(orderId: string, deviceId: string, n
       overallExpiresAt,
       expiresAt: overallExpiresAt,
       currentPage: 1,
-      visitedPages: [1],
-      pageReadingTimers: {
+      activeBlock: 1,
+      blockTimers: {
         1: {
-          firstOpenedAt: now,
-          readingExpiresAt: now, // Welcome page is free: no countdown required
-          isCompleted: true,
-          hasArrived: true
+          blockIndex: 1,
+          startedAt: now,
+          eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
+          isEligibleForNext: false
         }
-      },
-      activeTransition: null
+      }
     };
     activeViewingSessions.set(sessionKey, newSession);
     return { valid: true, remainingSeconds: OVERALL_VIEWING_SESSION_DURATION_SECONDS, session: newSession };
@@ -4361,12 +4371,13 @@ export function requestSessionNavigation(
 ): {
   success: boolean;
   navigated?: boolean;
-  transitioning?: boolean;
-  destinationPage?: number;
+  blockAdvanced?: boolean;
   currentPage?: number;
+  activeBlock?: number;
+  targetBlock?: number;
   remainingSeconds?: number;
-  expiresAt?: number;
-  waitingArrival?: boolean;
+  eligibilityExpiresAt?: number;
+  isEligibleForNext?: boolean;
   error?: string;
   message?: string;
 } {
@@ -4380,86 +4391,92 @@ export function requestSessionNavigation(
     return { success: false, error: 'invalid_page', message: 'Invalid page requested.' };
   }
 
-  if (targetPage === session.currentPage) {
-    return { success: true, navigated: true, currentPage: targetPage };
-  }
+  const targetBlock = getBlockIndexForPage(targetPage);
+  const currentActiveBlock = session.activeBlock;
 
-  // 1. Check if current page reading timer is active
-  const curTimer = session.pageReadingTimers[session.currentPage];
-  if (curTimer && !curTimer.isCompleted && now < curTimer.readingExpiresAt) {
-    const remaining = Math.ceil((curTimer.readingExpiresAt - now) / 1000);
-    return {
-      success: false,
-      error: 'page_reading_active',
-      message: `Current page reading countdown is active (${remaining}s remaining). Page navigation is locked.`,
-      remainingSeconds: remaining
-    };
-  }
-
-  // 2. Check if a 1-minute transition is active
-  if (session.activeTransition) {
-    if (session.activeTransition.destinationPage !== targetPage) {
-      const remaining = Math.max(0, Math.ceil((session.activeTransition.expiresAt - now) / 1000));
-      return {
-        success: false,
-        error: 'transition_in_progress',
-        message: `A navigation transition to Page ${session.activeTransition.destinationPage} is currently active.`,
-        destinationPage: session.activeTransition.destinationPage,
-        remainingSeconds: remaining
-      };
-    }
-    if (now >= session.activeTransition.expiresAt) {
-      session.currentPage = targetPage;
-      session.activeTransition = null;
-      return { success: true, navigated: true, currentPage: targetPage };
-    } else {
-      const remaining = Math.ceil((session.activeTransition.expiresAt - now) / 1000);
-      return {
-        success: true,
-        transitioning: true,
-        destinationPage: targetPage,
-        remainingSeconds: remaining,
-        expiresAt: session.activeTransition.expiresAt
-      };
-    }
-  }
-
-  // 3. Revisiting a previously visited page -> start 1-minute transition gate
-  if (session.visitedPages.includes(targetPage)) {
-    session.activeTransition = {
-      destinationPage: targetPage,
-      startedAt: now,
-      expiresAt: now + REVISIT_PAGE_TRANSITION_DURATION_MS
-    };
+  // 1. Moving between pages within the current ACTIVE block is always permitted without restarting timer
+  if (targetBlock === currentActiveBlock) {
+    session.currentPage = targetPage;
+    const curTimer = session.blockTimers[currentActiveBlock];
+    const rem = curTimer ? Math.max(0, Math.ceil((curTimer.eligibilityExpiresAt - now) / 1000)) : 0;
+    const isEligible = curTimer ? (curTimer.isEligibleForNext || now >= curTimer.eligibilityExpiresAt) : false;
     return {
       success: true,
-      transitioning: true,
-      destinationPage: targetPage,
-      remainingSeconds: REVISIT_PAGE_TRANSITION_DURATION_SECONDS,
-      expiresAt: session.activeTransition.expiresAt
+      navigated: true,
+      currentPage: targetPage,
+      activeBlock: currentActiveBlock,
+      remainingSeconds: rem,
+      eligibilityExpiresAt: curTimer?.eligibilityExpiresAt,
+      isEligibleForNext: isEligible
     };
   }
 
-  // 4. Navigating to a new, unvisited page -> open immediately with pending arrival
-  session.currentPage = targetPage;
-  session.visitedPages.push(targetPage);
-  const readingExpiresAt = now + NEW_PAGE_READING_DURATION_MS;
-  session.pageReadingTimers[targetPage] = {
-    firstOpenedAt: now,
-    readingExpiresAt,
-    isCompleted: false,
-    hasArrived: false
-  };
-  session.activeTransition = null;
+  // 2. Attempting to navigate BACK to a previous block (already locked)
+  if (targetBlock < currentActiveBlock) {
+    const range = getBlockPageRange(targetBlock);
+    return {
+      success: false,
+      error: 'previous_block_locked',
+      message: `Block ${targetBlock} (Pages ${range.startPage}–${range.endPage}) is permanently locked after advancing to Block ${currentActiveBlock}.`,
+      activeBlock: currentActiveBlock,
+      targetBlock
+    };
+  }
 
-  return {
-    success: true,
-    navigated: true,
-    currentPage: targetPage,
-    remainingSeconds: NEW_PAGE_READING_DURATION_SECONDS,
-    expiresAt: readingExpiresAt,
-    waitingArrival: true
-  };
+  // 3. Attempting to jump ahead beyond the immediate next block (e.g. Block 1 -> Block 3)
+  if (targetBlock > currentActiveBlock + 1) {
+    return {
+      success: false,
+      error: 'block_jump_prohibited',
+      message: `Direct jumping beyond the immediate next block is prohibited. You must progress sequentially.`,
+      activeBlock: currentActiveBlock,
+      targetBlock
+    };
+  }
+
+  // 4. Attempting to enter the immediate next block (e.g. Block 1 -> Block 2)
+  if (targetBlock === currentActiveBlock + 1) {
+    const curTimer = session.blockTimers[currentActiveBlock];
+    const isEligible = Boolean(curTimer && (curTimer.isEligibleForNext || now >= curTimer.eligibilityExpiresAt));
+
+    if (!isEligible) {
+      const remaining = curTimer ? Math.max(0, Math.ceil((curTimer.eligibilityExpiresAt - now) / 1000)) : 300;
+      return {
+        success: false,
+        error: 'next_block_not_eligible',
+        message: `Block ${targetBlock} is not yet eligible. Block ${currentActiveBlock}'s 5-minute timer has ${remaining}s remaining.`,
+        remainingSeconds: remaining,
+        activeBlock: currentActiveBlock,
+        targetBlock
+      };
+    }
+
+    // Next block IS eligible! Crossing into it locks the previous block and makes targetBlock ACTIVE.
+    session.activeBlock = targetBlock;
+    session.currentPage = targetPage;
+    if (!session.blockTimers[targetBlock]) {
+      session.blockTimers[targetBlock] = {
+        blockIndex: targetBlock,
+        startedAt: now,
+        eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
+        isEligibleForNext: false
+      };
+    }
+
+    const newTimer = session.blockTimers[targetBlock];
+    return {
+      success: true,
+      navigated: true,
+      blockAdvanced: true,
+      currentPage: targetPage,
+      activeBlock: targetBlock,
+      remainingSeconds: BLOCK_PROGRESSION_DURATION_SECONDS,
+      eligibilityExpiresAt: newTimer.eligibilityExpiresAt,
+      isEligibleForNext: false
+    };
+  }
+
+  return { success: false, error: 'invalid_navigation', message: 'Navigation request rejected.' };
 }
 
 export function recordPageArrival(
@@ -4470,9 +4487,12 @@ export function recordPageArrival(
 ): {
   success: boolean;
   arrived: boolean;
+  page?: number;
   currentPage: number;
+  activeBlock: number;
   remainingSeconds: number;
-  expiresAt: number;
+  eligibilityExpiresAt: number;
+  isEligibleForNext: boolean;
   isFirstArrival: boolean;
   error?: string;
   message?: string;
@@ -4482,9 +4502,12 @@ export function recordPageArrival(
     return { 
       success: false, 
       arrived: false, 
+      page: targetPage,
       currentPage: targetPage, 
+      activeBlock: 1,
       remainingSeconds: 0, 
-      expiresAt: 0, 
+      eligibilityExpiresAt: 0, 
+      isEligibleForNext: false,
       isFirstArrival: false, 
       error: 'session_expired', 
       message: 'Viewing session expired.' 
@@ -4496,66 +4519,33 @@ export function recordPageArrival(
     return { 
       success: false, 
       arrived: false, 
+      page: targetPage,
       currentPage: session.currentPage, 
+      activeBlock: session.activeBlock,
       remainingSeconds: 0, 
-      expiresAt: 0, 
+      eligibilityExpiresAt: 0, 
+      isEligibleForNext: false,
       isFirstArrival: false, 
       error: 'page_mismatch', 
       message: 'Requested arrival page does not match current active page.' 
     };
   }
 
-  // Welcome page 1 is free: already arrived and completed
-  if (targetPage === 1) {
-    return {
-      success: true,
-      arrived: true,
-      currentPage: 1,
-      remainingSeconds: 0,
-      expiresAt: now,
-      isFirstArrival: false
-    };
-  }
-
-  let timer = session.pageReadingTimers[targetPage];
-  if (!timer) {
-    timer = {
-      firstOpenedAt: now,
-      readingExpiresAt: now + NEW_PAGE_READING_DURATION_MS,
-      isCompleted: false,
-      hasArrived: false
-    };
-    session.pageReadingTimers[targetPage] = timer;
-  }
-
-  // If already arrived (or reading completed), DO NOT restart or reset the timer!
-  // Ensures ordinary rendering, zooming, scrolling within the current page, tab visibility changes, or network reconnection never reset the timer.
-  if (timer.hasArrived) {
-    const rem = timer.isCompleted ? 0 : Math.max(0, Math.ceil((timer.readingExpiresAt - now) / 1000));
-    return {
-      success: true,
-      arrived: true,
-      currentPage: targetPage,
-      remainingSeconds: rem,
-      expiresAt: timer.readingExpiresAt,
-      isFirstArrival: false
-    };
-  }
-
-  // First arrival event: Page has actually opened and landed in the viewer!
-  // Start the authoritative 120-second reading lock now.
-  timer.hasArrived = true;
-  timer.firstOpenedAt = now;
-  timer.readingExpiresAt = now + NEW_PAGE_READING_DURATION_MS;
-  timer.isCompleted = false;
+  const curBlock = session.activeBlock;
+  const curTimer = session.blockTimers[curBlock];
+  const rem = curTimer ? Math.max(0, Math.ceil((curTimer.eligibilityExpiresAt - now) / 1000)) : 0;
+  const isEligible = curTimer ? (curTimer.isEligibleForNext || now >= curTimer.eligibilityExpiresAt) : false;
 
   return {
     success: true,
     arrived: true,
+    page: targetPage,
     currentPage: targetPage,
-    remainingSeconds: NEW_PAGE_READING_DURATION_SECONDS,
-    expiresAt: timer.readingExpiresAt,
-    isFirstArrival: true
+    activeBlock: curBlock,
+    remainingSeconds: rem,
+    eligibilityExpiresAt: curTimer ? curTimer.eligibilityExpiresAt : 0,
+    isEligibleForNext: isEligible,
+    isFirstArrival: false
   };
 }
 
@@ -4569,37 +4559,12 @@ export function completeSessionTransition(
   currentPage?: number;
   error?: string;
   message?: string;
-  remainingSeconds?: number;
 } {
   const check = checkOrCreateViewingSession(orderId, deviceId, now);
   if (!check.valid || !check.session) {
     return { success: false, error: 'session_expired', message: 'Viewing session expired.' };
   }
-  const session = check.session;
-
-  if (!session.activeTransition) {
-    return { success: false, error: 'no_active_transition', message: 'No active transition found.' };
-  }
-
-  if (now < session.activeTransition.expiresAt) {
-    const remaining = Math.ceil((session.activeTransition.expiresAt - now) / 1000);
-    return {
-      success: false,
-      error: 'transition_not_completed',
-      message: `Transition countdown is still active (${remaining}s remaining).`,
-      remainingSeconds: remaining
-    };
-  }
-
-  const dest = session.activeTransition.destinationPage;
-  session.currentPage = dest;
-  session.activeTransition = null;
-
-  return {
-    success: true,
-    navigated: true,
-    currentPage: dest
-  };
+  return { success: true, navigated: true, currentPage: check.session.currentPage };
 }
 
 export function authorizeDirectPageAccess(
@@ -4615,32 +4580,32 @@ export function authorizeDirectPageAccess(
     return { allowed: false, reason: 'session_expired' };
   }
 
-  if (targetPage === session.currentPage) {
+  const targetBlock = getBlockIndexForPage(targetPage);
+  const activeBlock = session.activeBlock;
+
+  // 1. Pages inside the current active block are authorized
+  if (targetBlock === activeBlock) {
     return { allowed: true };
   }
 
-  // 1. Current page reading timer active
-  const curTimer = session.pageReadingTimers[session.currentPage];
-  if (curTimer && !curTimer.isCompleted && now < curTimer.readingExpiresAt) {
-    return { allowed: false, reason: 'current_page_reading_active' };
+  // 2. Pages belonging to older blocks are permanently locked
+  if (targetBlock < activeBlock) {
+    return { allowed: false, reason: 'previous_block_locked' };
   }
 
-  // 2. 1-minute transition gate active
-  if (session.activeTransition) {
-    if (session.activeTransition.destinationPage !== targetPage || now < session.activeTransition.expiresAt) {
-      return { allowed: false, reason: 'transition_in_progress' };
+  // 3. Pages belonging to next block: check eligibility
+  if (targetBlock === activeBlock + 1) {
+    const curTimer = session.blockTimers[activeBlock];
+    const isEligible = Boolean(curTimer && (curTimer.isEligibleForNext || now >= curTimer.eligibilityExpiresAt));
+    if (!isEligible) {
+      return { allowed: false, reason: 'next_block_not_eligible' };
     }
-    // Completed transition authorizes destination page
-    session.currentPage = targetPage;
-    session.activeTransition = null;
-    return { allowed: true };
+    // Eligible, but navigation request required to transition from eligible to active
+    return { allowed: false, reason: 'navigation_request_required' };
   }
 
-  // 3. Unauthorized direct jump without navigation request
-  if (session.visitedPages.includes(targetPage)) {
-    return { allowed: false, reason: 'transition_gate_required' };
-  }
-  return { allowed: false, reason: 'navigation_request_required' };
+  // 4. Any further block is strictly unauthorized
+  return { allowed: false, reason: 'block_jump_prohibited' };
 }
 
 app.get("/api/document/session/:token", async (req, res) => {
@@ -4664,14 +4629,16 @@ app.get("/api/document/session/:token", async (req, res) => {
 
     const session = sessionCheck.session;
     const now = Date.now();
-    const curTimer = session.pageReadingTimers[session.currentPage];
-    const pageRemainingSeconds = curTimer && !curTimer.isCompleted 
-        ? Math.max(0, Math.ceil((curTimer.readingExpiresAt - now) / 1000)) 
+    const curBlock = session.activeBlock;
+    const curBlockTimer = session.blockTimers[curBlock];
+    const blockRemainingSeconds = curBlockTimer 
+        ? Math.max(0, Math.ceil((curBlockTimer.eligibilityExpiresAt - now) / 1000)) 
         : 0;
+    const isEligibleForNext = curBlockTimer 
+        ? (curBlockTimer.isEligibleForNext || now >= curBlockTimer.eligibilityExpiresAt) 
+        : false;
 
-    const transitionRemainingSeconds = session.activeTransition 
-        ? Math.max(0, Math.ceil((session.activeTransition.expiresAt - now) / 1000))
-        : 0;
+    const blockRange = getBlockPageRange(curBlock);
 
     return res.json({ 
         success: true, 
@@ -4680,19 +4647,18 @@ app.get("/api/document/session/:token", async (req, res) => {
         overallExpiresAt: session.overallExpiresAt,
         expiresAt: session.overallExpiresAt,
         currentPage: session.currentPage,
-        visitedPages: session.visitedPages,
-        pageTimer: {
-            currentPage: session.currentPage,
-            isCompleted: Boolean(curTimer?.isCompleted || now >= (curTimer?.readingExpiresAt || 0)),
-            remainingSeconds: pageRemainingSeconds,
-            readingExpiresAt: curTimer?.readingExpiresAt || 0
+        activeBlock: curBlock,
+        blockRange: {
+            startPage: blockRange.startPage,
+            endPage: blockRange.endPage
         },
-        activeTransition: session.activeTransition ? {
-            destinationPage: session.activeTransition.destinationPage,
-            remainingSeconds: transitionRemainingSeconds,
-            expiresAt: session.activeTransition.expiresAt,
-            canComplete: now >= session.activeTransition.expiresAt
-        } : null
+        blockTimer: {
+            blockIndex: curBlock,
+            startedAt: curBlockTimer?.startedAt || now,
+            eligibilityExpiresAt: curBlockTimer?.eligibilityExpiresAt || (now + BLOCK_PROGRESSION_DURATION_MS),
+            remainingSeconds: blockRemainingSeconds,
+            isEligibleForNext
+        }
     });
 });
 
