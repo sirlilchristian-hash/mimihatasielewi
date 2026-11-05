@@ -20,8 +20,8 @@ import * as pdfjsLib from 'pdfjs-dist';
 // Configure worker src for pdfjs
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
-const OVERALL_SESSION_DURATION_MS = 600 * 1000; // 10 minutes (600 seconds)
 const BLOCK_PROGRESSION_DURATION_MS = 300 * 1000; // 5 minutes (300 seconds)
+const VISITED_BLOCK_GRACE_DURATION_MS = 120 * 1000; // 2 minutes (120 seconds)
 const BLOCK_PAGE_SIZE = 4;
 
 export function getBlockIndexForPage(page: number): number {
@@ -35,18 +35,27 @@ export function getBlockPageRange(blockIndex: number, totalPages?: number): { st
   return { startPage, endPage };
 }
 
-interface BlockTimerState {
+export interface BlockTimerState {
   blockIndex: number;
   startedAt: number;
   eligibilityExpiresAt: number;
   isEligibleForNext: boolean;
 }
 
-interface PersistedBlockSessionState {
-  overallExpiresAt: number;
+export interface VisitedBlockState {
+  blockIndex: number;
+  leftAt: number;
+  graceExpiresAt: number;
+}
+
+export interface PersistedBlockSessionState {
   currentPage: number;
   activeBlock: number;
   blockTimers: Record<number, BlockTimerState>;
+  visitedBlocks: Record<number, VisitedBlockState>;
+  customerFirstName?: string;
+  paperTitle?: string;
+  unitCode?: string;
   savedAt: number;
 }
 
@@ -56,7 +65,7 @@ function getStoredBlockSession(token: string): PersistedBlockSessionState | null
     const raw = window.sessionStorage.getItem(`godrery_block_session_${token}`);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.overallExpiresAt === 'number') {
+    if (parsed && typeof parsed.activeBlock === 'number') {
       return parsed as PersistedBlockSessionState;
     }
   } catch (e) {
@@ -77,14 +86,25 @@ function saveStoredBlockSession(token: string, state: Omit<PersistedBlockSession
   }
 }
 
-function PdfCanvasViewer({ token }: { token: string }) {
+interface PdfCanvasViewerProps {
+  token: string;
+  initialCustomerFirstName?: string;
+  initialPaperTitle?: string;
+  initialUnitCode?: string;
+}
+
+function PdfCanvasViewer({ 
+  token,
+  initialCustomerFirstName = '',
+  initialPaperTitle = '',
+  initialUnitCode = ''
+}: PdfCanvasViewerProps) {
   const initialSaved = useRef(getStoredBlockSession(token)).current;
   const now = Date.now();
-  const isInitialExpired = Boolean(initialSaved && initialSaved.overallExpiresAt <= now);
 
   const [pdfDoc, setPdfDoc] = useState<any>(null);
   const [currentPage, setCurrentPage] = useState<number>(() => {
-    if (initialSaved && !isInitialExpired && typeof initialSaved.currentPage === 'number') {
+    if (initialSaved && typeof initialSaved.currentPage === 'number') {
       return initialSaved.currentPage;
     }
     return 1;
@@ -96,32 +116,18 @@ function PdfCanvasViewer({ token }: { token: string }) {
   const [pdfError, setPdfError] = useState('');
   const [pageRenderError, setPageRenderError] = useState<string | null>(null);
   const [renderRetryTrigger, setRenderRetryTrigger] = useState(0);
-
-  // Overall 10-minute viewing session expiry
-  const [overallExpiresAt, setOverallExpiresAt] = useState<number>(() => {
-    if (initialSaved && !isInitialExpired) {
-      return initialSaved.overallExpiresAt;
-    }
-    return now + OVERALL_SESSION_DURATION_MS;
-  });
-  const [overallRemainingSeconds, setOverallRemainingSeconds] = useState<number>(() => {
-    if (initialSaved && !isInitialExpired) {
-      return Math.max(0, Math.floor((initialSaved.overallExpiresAt - now) / 1000));
-    }
-    return 600;
-  });
-  const [overallSessionExpired, setOverallSessionExpired] = useState(isInitialExpired);
+  const [, setTickerTime] = useState(now);
 
   // Four-Page Block Model State
   const [activeBlock, setActiveBlock] = useState<number>(() => {
-    if (initialSaved && !isInitialExpired && typeof initialSaved.activeBlock === 'number') {
+    if (initialSaved && typeof initialSaved.activeBlock === 'number') {
       return initialSaved.activeBlock;
     }
     return 1;
   });
 
   const [blockTimers, setBlockTimers] = useState<Record<number, BlockTimerState>>(() => {
-    if (initialSaved && !isInitialExpired && initialSaved.blockTimers) {
+    if (initialSaved && initialSaved.blockTimers) {
       const timers = { ...initialSaved.blockTimers };
       for (const [b, t] of Object.entries(timers)) {
         if (t && !t.isEligibleForNext && now >= t.eligibilityExpiresAt) {
@@ -140,6 +146,13 @@ function PdfCanvasViewer({ token }: { token: string }) {
     };
   });
 
+  const [visitedBlocks, setVisitedBlocks] = useState<Record<number, VisitedBlockState>>(() => {
+    if (initialSaved && initialSaved.visitedBlocks) {
+      return initialSaved.visitedBlocks;
+    }
+    return {};
+  });
+
   const currentBlockTimer = blockTimers[activeBlock] || {
     blockIndex: activeBlock,
     startedAt: now,
@@ -154,19 +167,16 @@ function PdfCanvasViewer({ token }: { token: string }) {
 
   // Persist session to sessionStorage on state changes
   useEffect(() => {
-    if (overallSessionExpired) {
-      try {
-        window.sessionStorage.removeItem(`godrery_block_session_${token}`);
-      } catch {}
-      return;
-    }
     saveStoredBlockSession(token, {
-      overallExpiresAt,
       currentPage,
       activeBlock,
-      blockTimers
+      blockTimers,
+      visitedBlocks,
+      customerFirstName: initialCustomerFirstName,
+      paperTitle: initialPaperTitle,
+      unitCode: initialUnitCode
     });
-  }, [token, overallExpiresAt, currentPage, activeBlock, blockTimers, overallSessionExpired]);
+  }, [token, currentPage, activeBlock, blockTimers, visitedBlocks, initialCustomerFirstName, initialPaperTitle, initialUnitCode]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -185,12 +195,12 @@ function PdfCanvasViewer({ token }: { token: string }) {
     return timeAnchorRef.current.wallNow + elapsed;
   }, []);
 
-  // Viewport Fit Scale computation
+  // Viewport Fit Scale computation: calculates fit for the container with padding
   const updateFitScale = useCallback(() => {
     if (!containerRef.current || !currentUnscaledDimRef.current) return;
     const container = containerRef.current;
-    const availW = Math.max(container.clientWidth - 32, 200);
-    const availH = Math.max(container.clientHeight - 32, 200);
+    const availW = Math.max(container.clientWidth - 48, 200);
+    const availH = Math.max(container.clientHeight - 48, 200);
     const { width, height } = currentUnscaledDimRef.current;
     if (width > 0 && height > 0) {
       const calculatedFit = Math.min(availW / width, availH / height);
@@ -227,6 +237,9 @@ function PdfCanvasViewer({ token }: { token: string }) {
         if (data.activeBlock && data.activeBlock !== activeBlock) {
           setActiveBlock(data.activeBlock);
         }
+        if (data.visitedBlocks) {
+          setVisitedBlocks(data.visitedBlocks);
+        }
         setBlockTimers(prev => ({
           ...prev,
           [data.activeBlock]: {
@@ -249,27 +262,21 @@ function PdfCanvasViewer({ token }: { token: string }) {
   const syncServerSession = useCallback(async () => {
     try {
       const res = await fetch(`/api/document/session/${token}`);
-      if (res.status === 403) {
-        setOverallSessionExpired(true);
-        return;
-      }
+      if (!res.ok) return;
       const data = await res.json();
       if (data.success) {
         timeAnchorRef.current = {
           perfNow: typeof performance !== 'undefined' ? performance.now() : 0,
           wallNow: Date.now()
         };
-        if (data.overallExpiresAt) {
-          setOverallExpiresAt(data.overallExpiresAt);
-          const rem = Math.max(0, Math.floor((data.overallExpiresAt - Date.now()) / 1000));
-          setOverallRemainingSeconds(rem);
-          if (rem <= 0) setOverallSessionExpired(true);
-        }
         if (data.currentPage && data.currentPage !== currentPage) {
           setCurrentPage(data.currentPage);
         }
         if (typeof data.activeBlock === 'number') {
           setActiveBlock(data.activeBlock);
+        }
+        if (data.visitedBlocks) {
+          setVisitedBlocks(data.visitedBlocks);
         }
         if (data.blockTimer) {
           setBlockTimers(prev => ({
@@ -285,7 +292,7 @@ function PdfCanvasViewer({ token }: { token: string }) {
         }
       }
     } catch (e) {
-      // offline / network error - monotonic timer continues locally
+      // offline / network error - timer continues locally
     }
   }, [token, currentPage]);
 
@@ -313,14 +320,7 @@ function PdfCanvasViewer({ token }: { token: string }) {
     const timer = setInterval(() => {
       const now = getMonotonicNow();
 
-      // 1. Overall session expiry
-      const overallRem = Math.max(0, Math.floor((overallExpiresAt - now) / 1000));
-      setOverallRemainingSeconds(overallRem);
-      if (overallRem <= 0) {
-        setOverallSessionExpired(true);
-      }
-
-      // 2. Block 5-minute eligibility timer
+      // Block 5-minute eligibility timer
       const bTimer = blockTimers[activeBlock];
       if (bTimer) {
         if (bTimer.isEligibleForNext) {
@@ -336,10 +336,12 @@ function PdfCanvasViewer({ token }: { token: string }) {
           }
         }
       }
+
+      setTickerTime(now);
     }, 500);
 
     return () => clearInterval(timer);
-  }, [overallExpiresAt, activeBlock, blockTimers, getMonotonicNow]);
+  }, [activeBlock, blockTimers, getMonotonicNow]);
 
   // Load PDF Document
   useEffect(() => {
@@ -348,10 +350,6 @@ function PdfCanvasViewer({ token }: { token: string }) {
       try {
         const res = await fetch(`/api/document/stream/${token}`);
         if (!res.ok) {
-          if (res.status === 403) {
-            setOverallSessionExpired(true);
-            return;
-          }
           throw new Error('Failed to load document stream.');
         }
         const arrayBuffer = await res.arrayBuffer();
@@ -446,24 +444,28 @@ function PdfCanvasViewer({ token }: { token: string }) {
     };
   }, []);
 
-  // Navigation Handler for Four-Page Block Model
+  // Navigation Handler for Four-Page Block Model with 2-Minute Visited Grace Period
   const handleRequestNavigation = async (targetPage: number) => {
-    if (overallSessionExpired) return;
     if (targetPage === currentPage || targetPage < 1 || targetPage > numPages) return;
 
     const targetBlock = getBlockIndexForPage(targetPage);
+    const now = getMonotonicNow();
 
-    // Rule 1: Cannot navigate to previously completed blocks (permanently locked)
+    // Check backward navigation into previous blocks:
     if (targetBlock < activeBlock) {
-      return;
+      const vb = visitedBlocks[targetBlock];
+      if (!vb || now >= vb.graceExpiresAt) {
+        // Grace period expired or never visited
+        return;
+      }
     }
 
-    // Rule 2: Cannot skip blocks
+    // Prohibit skipping blocks forward
     if (targetBlock > activeBlock + 1) {
       return;
     }
 
-    // Rule 3: Moving into next block requires eligibility (5 minutes in active block)
+    // Moving into immediate next block requires eligibility (5 minutes active on current block)
     if (targetBlock === activeBlock + 1) {
       const activeTimer = blockTimers[activeBlock];
       if (!activeTimer?.isEligibleForNext) {
@@ -489,15 +491,26 @@ function PdfCanvasViewer({ token }: { token: string }) {
 
       if (data.navigated) {
         setCurrentPage(targetPage);
+        if (data.visitedBlocks) {
+          setVisitedBlocks(data.visitedBlocks);
+        }
         if (data.blockAdvanced && data.activeBlock) {
           setActiveBlock(data.activeBlock);
-          const now = Date.now();
+          const nowTime = Date.now();
+          setVisitedBlocks(prev => ({
+            ...prev,
+            [activeBlock]: {
+              blockIndex: activeBlock,
+              leftAt: nowTime,
+              graceExpiresAt: nowTime + VISITED_BLOCK_GRACE_DURATION_MS
+            }
+          }));
           setBlockTimers(prev => ({
             ...prev,
             [data.activeBlock]: {
               blockIndex: data.activeBlock,
-              startedAt: now,
-              eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
+              startedAt: nowTime,
+              eligibilityExpiresAt: nowTime + BLOCK_PROGRESSION_DURATION_MS,
               isEligibleForNext: false
             }
           }));
@@ -508,16 +521,29 @@ function PdfCanvasViewer({ token }: { token: string }) {
       // Local fallback for offline / transient error
       if (targetBlock === activeBlock) {
         setCurrentPage(targetPage);
+      } else if (targetBlock < activeBlock) {
+        const vb = visitedBlocks[targetBlock];
+        if (vb && now < vb.graceExpiresAt) {
+          setCurrentPage(targetPage);
+        }
       } else if (targetBlock === activeBlock + 1 && blockTimers[activeBlock]?.isEligibleForNext) {
+        const nowTime = Date.now();
+        setVisitedBlocks(prev => ({
+          ...prev,
+          [activeBlock]: {
+            blockIndex: activeBlock,
+            leftAt: nowTime,
+            graceExpiresAt: nowTime + VISITED_BLOCK_GRACE_DURATION_MS
+          }
+        }));
         setActiveBlock(targetBlock);
         setCurrentPage(targetPage);
-        const now = Date.now();
         setBlockTimers(prev => ({
           ...prev,
           [targetBlock]: {
             blockIndex: targetBlock,
-            startedAt: now,
-            eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
+            startedAt: nowTime,
+            eligibilityExpiresAt: nowTime + BLOCK_PROGRESSION_DURATION_MS,
             isEligibleForNext: false
           }
         }));
@@ -533,37 +559,24 @@ function PdfCanvasViewer({ token }: { token: string }) {
   };
 
   // Determine navigation capabilities
+  const nowForRender = getMonotonicNow();
   const currentBlockRange = getBlockPageRange(activeBlock, numPages);
   const isEligibleForNext = Boolean(blockTimers[activeBlock]?.isEligibleForNext);
 
-  const canGoPrev = currentPage > 1 && getBlockIndexForPage(currentPage - 1) === activeBlock;
-  const canGoNext = currentPage < numPages && (
-    getBlockIndexForPage(currentPage + 1) === activeBlock ||
-    (getBlockIndexForPage(currentPage + 1) === activeBlock + 1 && isEligibleForNext)
+  const prevPageNum = currentPage - 1;
+  const prevPageBlock = prevPageNum >= 1 ? getBlockIndexForPage(prevPageNum) : null;
+  const canGoPrev = prevPageNum >= 1 && (
+    prevPageBlock === activeBlock ||
+    Boolean(prevPageBlock && visitedBlocks[prevPageBlock] && nowForRender < visitedBlocks[prevPageBlock].graceExpiresAt)
   );
 
-  // Expired Screen
-  if (overallSessionExpired) {
-    return (
-      <div className="flex-grow w-full h-full flex items-center justify-center bg-slate-950 p-6 text-center">
-        <div className="max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-8 space-y-4 shadow-2xl">
-          <div className="w-16 h-16 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center mx-auto">
-            <Clock className="w-8 h-8" />
-          </div>
-          <h2 className="text-xl font-bold text-white">Viewing Session Expired</h2>
-          <p className="text-sm text-slate-400 leading-relaxed">
-            Your 10-minute secure viewing session has ended. To continue reading, please reopen the document from your secure email link.
-          </p>
-          <button
-            onClick={() => window.location.href = '/'}
-            className="w-full py-3 bg-[#00D26A] hover:bg-[#00b85c] text-white font-bold rounded-xl transition-all cursor-pointer"
-          >
-            Return to Home
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const nextPageNum = currentPage + 1;
+  const nextPageBlock = nextPageNum <= numPages ? getBlockIndexForPage(nextPageNum) : null;
+  const canGoNext = nextPageNum <= numPages && (
+    nextPageBlock === activeBlock ||
+    (nextPageBlock === activeBlock + 1 && isEligibleForNext) ||
+    Boolean(nextPageBlock && visitedBlocks[nextPageBlock] && nowForRender < visitedBlocks[nextPageBlock].graceExpiresAt)
+  );
 
   // Loading Screen
   if (loadingPdf) {
@@ -624,8 +637,8 @@ function PdfCanvasViewer({ token }: { token: string }) {
             title={
               currentPage <= 1
                 ? "First page"
-                : getBlockIndexForPage(currentPage - 1) < activeBlock
-                  ? "Previous block is permanently locked"
+                : prevPageBlock && prevPageBlock < activeBlock && (!visitedBlocks[prevPageBlock] || nowForRender >= visitedBlocks[prevPageBlock].graceExpiresAt)
+                  ? `Block ${prevPageBlock} is permanently locked`
                   : `Previous Page (${currentPage - 1})`
             }
           >
@@ -653,12 +666,19 @@ function PdfCanvasViewer({ token }: { token: string }) {
                 let label = `Page ${p} (Block ${pBlock})`;
                 let disabled = false;
 
-                if (isPastBlock) {
-                  label = `Page ${p} (Block ${pBlock} • Locked)`;
-                  disabled = true;
-                } else if (isCurrentBlock) {
+                if (isCurrentBlock) {
                   label = `Page ${p} (Block ${pBlock} • Active)`;
                   disabled = false;
+                } else if (isPastBlock) {
+                  const vb = visitedBlocks[pBlock];
+                  if (vb && nowForRender < vb.graceExpiresAt) {
+                    const graceSecs = Math.max(0, Math.ceil((vb.graceExpiresAt - nowForRender) / 1000));
+                    label = `Page ${p} (Block ${pBlock} • Closes in ${formatTime(graceSecs)})`;
+                    disabled = false;
+                  } else {
+                    label = `Page ${p} (Block ${pBlock} • Locked)`;
+                    disabled = true;
+                  }
                 } else if (isNextBlock) {
                   if (isEligibleForNext) {
                     label = `Page ${p} (Block ${pBlock} • Eligible to Enter)`;
@@ -689,9 +709,9 @@ function PdfCanvasViewer({ token }: { token: string }) {
             title={
               currentPage >= numPages
                 ? "Last page"
-                : getBlockIndexForPage(currentPage + 1) === activeBlock
+                : nextPageBlock === activeBlock
                   ? `Next Page (${currentPage + 1})`
-                  : isEligibleForNext
+                  : nextPageBlock === activeBlock + 1 && isEligibleForNext
                     ? `Enter Block ${activeBlock + 1} (Page ${currentPage + 1})`
                     : `Next block unlocks in ${formatTime(blockRemainingSeconds)}`
             }
@@ -722,11 +742,20 @@ function PdfCanvasViewer({ token }: { token: string }) {
             </div>
           )}
 
-          {/* Overall 10-Minute Session Timer */}
-          <div className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/20 px-3 py-1 rounded-full text-amber-400 text-xs font-medium">
-            <Clock className="w-3.5 h-3.5 shrink-0" />
-            <span>Overall Session: <strong>{formatTime(overallRemainingSeconds)}</strong></span>
-          </div>
+          {/* Visited Block Grace Countdown Badges */}
+          {Object.values(visitedBlocks).map(vb => {
+            const graceRem = Math.max(0, Math.ceil((vb.graceExpiresAt - nowForRender) / 1000));
+            if (graceRem <= 0) return null;
+            return (
+              <div 
+                key={vb.blockIndex} 
+                className="flex items-center gap-1.5 bg-amber-500/15 border border-amber-500/40 px-3 py-1 rounded-full text-amber-300 text-xs font-semibold shadow-xs"
+              >
+                <Clock className="w-3.5 h-3.5 shrink-0 animate-pulse text-amber-400" />
+                <span>Block {vb.blockIndex} Closes In: <strong>{formatTime(graceRem)}</strong></span>
+              </div>
+            );
+          })}
 
           {/* Zoom & Viewport Fit Controls (Always interactive during reading) */}
           <div className="flex items-center gap-1 bg-slate-800 rounded-lg p-1">
@@ -764,36 +793,38 @@ function PdfCanvasViewer({ token }: { token: string }) {
         </div>
       </div>
 
-      {/* Canvas Container with Auto-Fit Viewport & Disabled Context Menu */}
+      {/* Canvas Container with Auto-Fit Viewport & Clean Edge-to-Edge Zoom Scrolling */}
       <div 
         ref={containerRef}
-        className="flex-grow overflow-auto flex items-center justify-center p-4 relative z-0"
+        className="flex-grow overflow-auto p-4 sm:p-6 relative z-0"
       >
-        <div 
-          id="godrery-canvas-wrapper"
-          className="shadow-2xl bg-white rounded-lg overflow-hidden border border-slate-700 relative min-w-[200px] min-h-[200px]"
-        >
-          {pageRenderError && (
-            <div className="absolute inset-0 bg-slate-900/90 backdrop-blur-xs flex flex-col items-center justify-center p-4 text-center z-30">
-              <AlertTriangle className="w-8 h-8 text-rose-400 mb-2" />
-              <p className="text-xs sm:text-sm text-slate-200 mb-3">{pageRenderError}</p>
-              <button
-                type="button"
-                onClick={() => {
-                  setPageRenderError(null);
-                  setRenderRetryTrigger(t => t + 1);
-                }}
-                className="px-4 py-2 bg-[#00D26A] text-slate-950 font-bold rounded-lg text-xs hover:bg-[#00b85c] cursor-pointer"
-              >
-                Retry Page Render
-              </button>
-            </div>
-          )}
-          <canvas 
-            id="godrery-active-canvas"
-            ref={canvasRef} 
-            className="block shadow-lg" 
-          />
+        <div className="min-w-full min-h-full flex items-center justify-center">
+          <div 
+            id="godrery-canvas-wrapper"
+            className="shadow-2xl bg-white rounded-lg overflow-hidden border border-slate-700 relative m-auto shrink-0 min-w-[200px] min-h-[200px]"
+          >
+            {pageRenderError && (
+              <div className="absolute inset-0 bg-slate-900/90 backdrop-blur-xs flex flex-col items-center justify-center p-4 text-center z-30">
+                <AlertTriangle className="w-8 h-8 text-rose-400 mb-2" />
+                <p className="text-xs sm:text-sm text-slate-200 mb-3">{pageRenderError}</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPageRenderError(null);
+                    setRenderRetryTrigger(t => t + 1);
+                  }}
+                  className="px-4 py-2 bg-[#00D26A] text-slate-950 font-bold rounded-lg text-xs hover:bg-[#00b85c] cursor-pointer"
+                >
+                  Retry Page Render
+                </button>
+              </div>
+            )}
+            <canvas 
+              id="godrery-active-canvas"
+              ref={canvasRef} 
+              className="block shadow-lg" 
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -809,6 +840,11 @@ export function DocumentAccessView() {
   
   const [firstName, setFirstName] = useState('');
   const [secondName, setSecondName] = useState('');
+
+  // Customer Welcome Header Metadata
+  const [customerFirstName, setCustomerFirstName] = useState('');
+  const [paperTitle, setPaperTitle] = useState('');
+  const [unitCode, setUnitCode] = useState('');
   
   const [isVerifying, setIsVerifying] = useState(false);
 
@@ -835,8 +871,14 @@ export function DocumentAccessView() {
       });
       const data = await res.json();
       if (data.success) {
+        if (data.firstName) setCustomerFirstName(data.firstName);
+        if (data.paperTitle) setPaperTitle(data.paperTitle);
+        if (data.unitCode) setUnitCode(data.unitCode);
         setVerified(true);
       } else if (data.requireNames) {
+        if (data.firstName) setCustomerFirstName(data.firstName);
+        if (data.paperTitle) setPaperTitle(data.paperTitle);
+        if (data.unitCode) setUnitCode(data.unitCode);
         setRequireNames(true);
       } else {
         setError(data.error || 'Access denied');
@@ -860,6 +902,9 @@ export function DocumentAccessView() {
       });
       const data = await res.json();
       if (data.success) {
+        if (data.firstName) setCustomerFirstName(data.firstName);
+        if (data.paperTitle) setPaperTitle(data.paperTitle);
+        if (data.unitCode) setUnitCode(data.unitCode);
         setRequireNames(false);
         setVerified(true);
       } else {
@@ -883,22 +928,42 @@ export function DocumentAccessView() {
   if (verified) {
     return (
       <div className="w-full h-screen bg-[#052b1b] flex flex-col">
-        <div className="w-full bg-[#031d12] border-b border-slate-800 p-3 sm:px-6 flex items-center justify-between shadow-sm shrink-0">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-full bg-[#00D26A]/20 text-[#00D26A] flex items-center justify-center">
-              <Shield className="w-4 h-4" />
+        {/* Customer Welcome Header */}
+        <div className="w-full bg-[#031d12] border-b border-slate-800 px-4 py-3 sm:px-6 flex flex-wrap items-center justify-between gap-3 shadow-sm shrink-0">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-full bg-[#00D26A]/20 text-[#00D26A] flex items-center justify-center shrink-0">
+              <Shield className="w-5 h-5" />
             </div>
-            <h1 className="text-sm font-bold text-white tracking-wide">Secure Document Access (Godrery Publishers)</h1>
+            <div className="flex flex-col">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-[#00D26A] tracking-wider uppercase">
+                  Welcome, {customerFirstName || 'Customer'}
+                </span>
+                {unitCode && (
+                  <span className="text-[10px] bg-slate-800 text-slate-300 font-mono px-1.5 py-0.5 rounded border border-slate-700">
+                    {unitCode}
+                  </span>
+                )}
+              </div>
+              <h1 className="text-sm sm:text-base font-bold text-white tracking-tight leading-tight">
+                {paperTitle || 'Protected Document'}
+              </h1>
+            </div>
           </div>
           <button 
             onClick={() => window.location.href = '/'} 
-            className="text-xs text-slate-400 hover:text-white transition-colors flex items-center gap-1.5 cursor-pointer"
+            className="text-xs text-slate-400 hover:text-white transition-colors flex items-center gap-1.5 cursor-pointer py-1.5 px-3 rounded-lg bg-slate-800 hover:bg-slate-700"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
             <span>Return to Home</span>
           </button>
         </div>
-        <PdfCanvasViewer token={token} />
+        <PdfCanvasViewer 
+          token={token} 
+          initialCustomerFirstName={customerFirstName}
+          initialPaperTitle={paperTitle}
+          initialUnitCode={unitCode}
+        />
       </div>
     );
   }

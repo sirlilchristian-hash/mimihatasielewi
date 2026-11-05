@@ -4162,13 +4162,30 @@ app.post("/api/document/verify", async (req, res) => {
     // Authoritative check: order must exist and be paid
     const { data: order, error: orderErr } = await supabaseAdmin
       .from('Orders')
-      .select('id, status, paper_id')
+      .select('id, status, paper_id, customers(first_name, second_name)')
       .eq('id', orderId)
       .maybeSingle();
 
     if (orderErr || !order || order.status !== 'paid') {
       return res.status(403).json({ error: "Access denied. Payment is awaiting verification or has not been confirmed." });
     }
+
+    let paperTitle = 'Protected Document';
+    let unitCode = '';
+    if (order.paper_id) {
+      const { data: paper } = await supabaseAdmin
+        .from('Papers')
+        .select('paper_title, unit_code')
+        .eq('id', order.paper_id)
+        .maybeSingle();
+      if (paper) {
+        paperTitle = paper.paper_title || paperTitle;
+        unitCode = paper.unit_code || '';
+      }
+    }
+
+    const cust = Array.isArray(order.customers) ? order.customers[0] : order.customers;
+    const firstName = cust?.first_name || '';
 
     const cookies = req.headers.cookie || '';
     const match = cookies.match(/(?:^|; )device_id=([^;]*)/);
@@ -4178,7 +4195,16 @@ app.post("/api/document/verify", async (req, res) => {
     
     if (deviceId && isDeviceAuthorizedForOrder(devices, deviceId)) {
         console.log(`[ACCESS LOG] Successful access to order ${orderId} by device ${deviceId}`);
-        return res.json({ success: true });
+        const sess = activeViewingSessions.get(`${orderId}:${deviceId}`);
+        if (sess) {
+            sess.customerInfo = { firstName, paperTitle, unitCode };
+        }
+        return res.json({ 
+            success: true,
+            firstName,
+            paperTitle,
+            unitCode
+        });
     }
     
     let limit = 3;
@@ -4194,7 +4220,7 @@ app.post("/api/document/verify", async (req, res) => {
 
     const currentCount = getDistinctDeviceCount(devices);
     if (currentCount < limit) {
-        return res.json({ requireNames: true });
+        return res.json({ requireNames: true, firstName, paperTitle, unitCode });
     } else {
         return res.json({ error: `Device limit reached. This document has already been registered on ${limit} devices.` });
     }
@@ -4246,7 +4272,30 @@ app.post("/api/document/register-device", async (req, res) => {
             if (rpcResult.success) {
                 console.log(`[ACCESS LOG] Order ${orderId} registered atomically via RPC to device ${deviceId} (${rpcResult.status})`);
                 res.setHeader('Set-Cookie', `device_id=${deviceId}; HttpOnly; Path=/; Max-Age=315360000; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
-                return res.json({ success: true });
+
+                let paperTitle = 'Protected Document';
+                let unitCode = '';
+                if (order.paper_id) {
+                    const { data: paper } = await supabaseAdmin
+                        .from('Papers')
+                        .select('paper_title, unit_code')
+                        .eq('id', order.paper_id)
+                        .maybeSingle();
+                    if (paper) {
+                        paperTitle = paper.paper_title || paperTitle;
+                        unitCode = paper.unit_code || '';
+                    }
+                }
+                const sess = activeViewingSessions.get(`${orderId}:${deviceId}`);
+                if (sess) {
+                    sess.customerInfo = { firstName: cust.first_name, paperTitle, unitCode };
+                }
+                return res.json({ 
+                    success: true,
+                    firstName: cust.first_name,
+                    paperTitle,
+                    unitCode
+                });
             } else if (rpcResult.error === 'device_limit_reached') {
                 const effectiveLimit = rpcResult.limit || 3;
                 return res.status(400).json({ error: `Device limit reached. This document has already been registered on ${effectiveLimit} devices.` });
@@ -4271,19 +4320,22 @@ app.post("/api/document/register-device", async (req, res) => {
 });
 
 // Viewing Session & Four-Page Block Reading Management Constants
-export const OVERALL_VIEWING_SESSION_DURATION_MS = 10 * 60 * 1000; // 600,000 ms (10 minutes)
+export const OVERALL_VIEWING_SESSION_DURATION_MS = 10 * 60 * 1000; // Deprecated legacy constant
 export const OVERALL_VIEWING_SESSION_DURATION_SECONDS = 600;
 
 export const BLOCK_PROGRESSION_DURATION_MS = 5 * 60 * 1000; // 300,000 ms (5 minutes)
 export const BLOCK_PROGRESSION_DURATION_SECONDS = 300;
+
+export const VISITED_BLOCK_GRACE_DURATION_MS = 2 * 60 * 1000; // 120,000 ms (2 minutes)
+export const VISITED_BLOCK_GRACE_DURATION_SECONDS = 120;
 
 export const BLOCK_PAGE_SIZE = 4;
 
 // Backward-compatibility aliases
 export const NEW_PAGE_READING_DURATION_MS = BLOCK_PROGRESSION_DURATION_MS;
 export const NEW_PAGE_READING_DURATION_SECONDS = BLOCK_PROGRESSION_DURATION_SECONDS;
-export const REVISIT_PAGE_TRANSITION_DURATION_MS = 60 * 1000;
-export const REVISIT_PAGE_TRANSITION_DURATION_SECONDS = 60;
+export const REVISIT_PAGE_TRANSITION_DURATION_MS = VISITED_BLOCK_GRACE_DURATION_MS;
+export const REVISIT_PAGE_TRANSITION_DURATION_SECONDS = VISITED_BLOCK_GRACE_DURATION_SECONDS;
 
 export function getBlockIndexForPage(page: number): number {
   if (!Number.isInteger(page) || page < 1) return 1;
@@ -4304,14 +4356,26 @@ export interface BlockTimerState {
   isEligibleForNext: boolean;
 }
 
+export interface VisitedBlockState {
+  blockIndex: number;
+  leftAt: number;
+  graceExpiresAt: number;
+}
+
 export interface ViewingSessionData {
   orderId: string;
   deviceId: string;
-  overallExpiresAt: number;
-  expiresAt: number; // alias for overallExpiresAt for backwards compatibility
+  overallExpiresAt?: number;
+  expiresAt?: number; // alias for overallExpiresAt for backwards compatibility
   currentPage: number;
   activeBlock: number;
   blockTimers: Record<number, BlockTimerState>;
+  visitedBlocks: Record<number, VisitedBlockState>;
+  customerInfo?: {
+    firstName?: string;
+    paperTitle?: string;
+    unitCode?: string;
+  };
 }
 
 export const activeViewingSessions = new Map<string, ViewingSessionData>();
@@ -4325,28 +4389,20 @@ export function checkOrCreateViewingSession(orderId: string, deviceId: string, n
   const existing = activeViewingSessions.get(sessionKey);
   
   if (existing) {
-    const overallExpiry = Math.min(
-      existing.overallExpiresAt ?? Infinity,
-      existing.expiresAt ?? Infinity
-    );
-    if (now > overallExpiry) {
-      activeViewingSessions.delete(sessionKey);
-      return { valid: false, remainingSeconds: 0, session: null };
+    if (!existing.visitedBlocks) {
+      existing.visitedBlocks = {};
     }
     // Update block eligibility status if block timer has completed
     const curBlockTimer = existing.blockTimers[existing.activeBlock];
     if (curBlockTimer && !curBlockTimer.isEligibleForNext && now >= curBlockTimer.eligibilityExpiresAt) {
       curBlockTimer.isEligibleForNext = true;
     }
-    const remainingSeconds = Math.max(0, Math.floor((overallExpiry - now) / 1000));
-    return { valid: true, remainingSeconds, session: existing };
+    const curRemaining = curBlockTimer ? Math.max(0, Math.ceil((curBlockTimer.eligibilityExpiresAt - now) / 1000)) : 0;
+    return { valid: true, remainingSeconds: curRemaining, session: existing };
   } else {
-    const overallExpiresAt = now + OVERALL_VIEWING_SESSION_DURATION_MS; // 10 minutes TTL
     const newSession: ViewingSessionData = {
       orderId,
       deviceId,
-      overallExpiresAt,
-      expiresAt: overallExpiresAt,
       currentPage: 1,
       activeBlock: 1,
       blockTimers: {
@@ -4356,10 +4412,11 @@ export function checkOrCreateViewingSession(orderId: string, deviceId: string, n
           eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
           isEligibleForNext: false
         }
-      }
+      },
+      visitedBlocks: {}
     };
     activeViewingSessions.set(sessionKey, newSession);
-    return { valid: true, remainingSeconds: OVERALL_VIEWING_SESSION_DURATION_SECONDS, session: newSession };
+    return { valid: true, remainingSeconds: BLOCK_PROGRESSION_DURATION_SECONDS, session: newSession };
   }
 }
 
@@ -4378,6 +4435,7 @@ export function requestSessionNavigation(
   remainingSeconds?: number;
   eligibilityExpiresAt?: number;
   isEligibleForNext?: boolean;
+  visitedBlocks?: Record<number, VisitedBlockState>;
   error?: string;
   message?: string;
 } {
@@ -4407,17 +4465,37 @@ export function requestSessionNavigation(
       activeBlock: currentActiveBlock,
       remainingSeconds: rem,
       eligibilityExpiresAt: curTimer?.eligibilityExpiresAt,
-      isEligibleForNext: isEligible
+      isEligibleForNext: isEligible,
+      visitedBlocks: session.visitedBlocks
     };
   }
 
-  // 2. Attempting to navigate BACK to a previous block (already locked)
+  // 2. Attempting to navigate BACK to a previously visited block
   if (targetBlock < currentActiveBlock) {
+    const visited = session.visitedBlocks?.[targetBlock];
+    if (visited && now < visited.graceExpiresAt) {
+      // Permitted during 2-minute grace period!
+      session.currentPage = targetPage;
+      const curTimer = session.blockTimers[currentActiveBlock];
+      const rem = curTimer ? Math.max(0, Math.ceil((curTimer.eligibilityExpiresAt - now) / 1000)) : 0;
+      const isEligible = curTimer ? (curTimer.isEligibleForNext || now >= curTimer.eligibilityExpiresAt) : false;
+      return {
+        success: true,
+        navigated: true,
+        currentPage: targetPage,
+        activeBlock: currentActiveBlock,
+        remainingSeconds: rem,
+        eligibilityExpiresAt: curTimer?.eligibilityExpiresAt,
+        isEligibleForNext: isEligible,
+        visitedBlocks: session.visitedBlocks
+      };
+    }
+
     const range = getBlockPageRange(targetBlock);
     return {
       success: false,
       error: 'previous_block_locked',
-      message: `Block ${targetBlock} (Pages ${range.startPage}–${range.endPage}) is permanently locked after advancing to Block ${currentActiveBlock}.`,
+      message: `Block ${targetBlock} (Pages ${range.startPage}–${range.endPage}) is permanently locked.`,
       activeBlock: currentActiveBlock,
       targetBlock
     };
@@ -4451,7 +4529,15 @@ export function requestSessionNavigation(
       };
     }
 
-    // Next block IS eligible! Crossing into it locks the previous block and makes targetBlock ACTIVE.
+    // Next block IS eligible!
+    // Current active block now enters its own independent 2-minute visited grace period:
+    if (!session.visitedBlocks) session.visitedBlocks = {};
+    session.visitedBlocks[currentActiveBlock] = {
+      blockIndex: currentActiveBlock,
+      leftAt: now,
+      graceExpiresAt: now + VISITED_BLOCK_GRACE_DURATION_MS
+    };
+
     session.activeBlock = targetBlock;
     session.currentPage = targetPage;
     if (!session.blockTimers[targetBlock]) {
@@ -4472,7 +4558,8 @@ export function requestSessionNavigation(
       activeBlock: targetBlock,
       remainingSeconds: BLOCK_PROGRESSION_DURATION_SECONDS,
       eligibilityExpiresAt: newTimer.eligibilityExpiresAt,
-      isEligibleForNext: false
+      isEligibleForNext: false,
+      visitedBlocks: session.visitedBlocks
     };
   }
 
@@ -4494,6 +4581,7 @@ export function recordPageArrival(
   eligibilityExpiresAt: number;
   isEligibleForNext: boolean;
   isFirstArrival: boolean;
+  visitedBlocks?: Record<number, VisitedBlockState>;
   error?: string;
   message?: string;
 } {
@@ -4545,7 +4633,8 @@ export function recordPageArrival(
     remainingSeconds: rem,
     eligibilityExpiresAt: curTimer ? curTimer.eligibilityExpiresAt : 0,
     isEligibleForNext: isEligible,
-    isFirstArrival: false
+    isFirstArrival: false,
+    visitedBlocks: session.visitedBlocks
   };
 }
 
@@ -4572,14 +4661,6 @@ export function authorizeDirectPageAccess(
   targetPage: number,
   now: number = Date.now()
 ): { allowed: boolean; reason?: string } {
-  const overallExpiry = Math.min(
-    session.overallExpiresAt ?? Infinity,
-    session.expiresAt ?? Infinity
-  );
-  if (now > overallExpiry) {
-    return { allowed: false, reason: 'session_expired' };
-  }
-
   const targetBlock = getBlockIndexForPage(targetPage);
   const activeBlock = session.activeBlock;
 
@@ -4588,8 +4669,12 @@ export function authorizeDirectPageAccess(
     return { allowed: true };
   }
 
-  // 2. Pages belonging to older blocks are permanently locked
+  // 2. Pages belonging to older blocks: check 2-minute grace period
   if (targetBlock < activeBlock) {
+    const visited = session.visitedBlocks?.[targetBlock];
+    if (visited && now < visited.graceExpiresAt) {
+      return { allowed: true };
+    }
     return { allowed: false, reason: 'previous_block_locked' };
   }
 
@@ -4624,7 +4709,7 @@ app.get("/api/document/session/:token", async (req, res) => {
 
     const sessionCheck = checkOrCreateViewingSession(orderId, deviceId);
     if (!sessionCheck.valid || !sessionCheck.session) {
-        return res.status(403).json({ error: "Viewing session expired (10-minute limit reached)." });
+        return res.status(403).json({ error: "Viewing session expired." });
     }
 
     const session = sessionCheck.session;
@@ -4640,12 +4725,39 @@ app.get("/api/document/session/:token", async (req, res) => {
 
     const blockRange = getBlockPageRange(curBlock);
 
+    if (!session.customerInfo) {
+        try {
+            const { data: order } = await supabaseAdmin
+                .from('Orders')
+                .select('id, paper_id, customers(first_name)')
+                .eq('id', orderId)
+                .maybeSingle();
+            if (order) {
+                let paperTitle = 'Protected Document';
+                let unitCode = '';
+                if (order.paper_id) {
+                    const { data: paper } = await supabaseAdmin
+                        .from('Papers')
+                        .select('paper_title, unit_code')
+                        .eq('id', order.paper_id)
+                        .maybeSingle();
+                    if (paper) {
+                        paperTitle = paper.paper_title || paperTitle;
+                        unitCode = paper.unit_code || '';
+                    }
+                }
+                const cust = Array.isArray(order.customers) ? order.customers[0] : order.customers;
+                session.customerInfo = {
+                    firstName: cust?.first_name || '',
+                    paperTitle,
+                    unitCode
+                };
+            }
+        } catch {}
+    }
+
     return res.json({ 
         success: true, 
-        overallRemainingSeconds: sessionCheck.remainingSeconds, 
-        remainingSeconds: sessionCheck.remainingSeconds,
-        overallExpiresAt: session.overallExpiresAt,
-        expiresAt: session.overallExpiresAt,
         currentPage: session.currentPage,
         activeBlock: curBlock,
         blockRange: {
@@ -4658,7 +4770,9 @@ app.get("/api/document/session/:token", async (req, res) => {
             eligibilityExpiresAt: curBlockTimer?.eligibilityExpiresAt || (now + BLOCK_PROGRESSION_DURATION_MS),
             remainingSeconds: blockRemainingSeconds,
             isEligibleForNext
-        }
+        },
+        visitedBlocks: session.visitedBlocks || {},
+        customerInfo: session.customerInfo || null
     });
 });
 
@@ -4764,14 +4878,14 @@ app.get("/api/document/page/:token/:pageNum", async (req, res) => {
 
     const sessionCheck = checkOrCreateViewingSession(orderId, deviceId);
     if (!sessionCheck.valid || !sessionCheck.session) {
-        return res.status(403).send("Viewing session expired (10-minute limit reached).");
+        return res.status(403).send("Viewing session expired.");
     }
 
     const authCheck = authorizeDirectPageAccess(sessionCheck.session, targetPage);
     if (!authCheck.allowed) {
         console.warn(`[DIRECT PAGE BLOCKED] Order ${orderId}, Device ${deviceId}, Page ${targetPage}: ${authCheck.reason}`);
         if (authCheck.reason === 'session_expired') {
-            return res.status(403).send("Viewing session expired (10-minute limit reached).");
+            return res.status(403).send("Viewing session expired.");
         }
         if (authCheck.reason === 'current_page_reading_active') {
             return res.status(403).send("Page access blocked: Current page reading countdown is active.");
@@ -4861,8 +4975,8 @@ app.get("/api/document/stream/:token", async (req, res) => {
 
     const sessionCheck = checkOrCreateViewingSession(orderId, deviceId);
     if (!sessionCheck.valid) {
-        console.warn(`[ACCESS LOG] Stream rejected for ${orderId}: 10-minute viewing session expired.`);
-        return res.status(403).send("Viewing session expired (10-minute limit reached). Please reopen the document from your secure email link.");
+        console.warn(`[ACCESS LOG] Stream rejected for ${orderId}: Viewing session expired.`);
+        return res.status(403).send("Viewing session expired. Please reopen the document from your secure email link.");
     }
     
     const { data: order, error: orderErr } = await supabaseAdmin

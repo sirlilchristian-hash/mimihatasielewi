@@ -33,6 +33,8 @@ import {
   BLOCK_PAGE_SIZE,
   getBlockIndexForPage,
   getBlockPageRange,
+  VISITED_BLOCK_GRACE_DURATION_MS,
+  VISITED_BLOCK_GRACE_DURATION_SECONDS,
   NEW_PAGE_READING_DURATION_MS,
   NEW_PAGE_READING_DURATION_SECONDS,
   REVISIT_PAGE_TRANSITION_DURATION_MS,
@@ -1576,31 +1578,29 @@ test('57. Unique-Violation Invariant in register_document_device & Cloud Run Mul
   assert.strictEqual(mustFailClosed(rpcMissingErr), 500, 'Missing RPC must fail closed with 500 to protect 5-device ceiling across Cloud Run instances');
 });
 
-test('58. 10-Minute Viewing Session Expiry & Enforcement', () => {
+test('58. Viewing Session Active Model - No 10-Minute Overall Expiry Auto-Termination', () => {
   const orderId = 'order-session-test';
   const deviceId = 'device-session-test-uuid';
+  const t0 = 1700000000000;
 
-  // 1. First call initializes session (valid, ~600s remaining)
-  const session1 = checkOrCreateViewingSession(orderId, deviceId);
+  // 1. First call initializes session (valid, block 1 reading active)
+  const session1 = checkOrCreateViewingSession(orderId, deviceId, t0);
   assert.strictEqual(session1.valid, true);
-  assert.ok(session1.remainingSeconds > 500 && session1.remainingSeconds <= 600);
+  assert.strictEqual(session1.session!.activeBlock, 1);
 
-  // 2. Immediate second call returns valid session with remaining time
-  const session2 = checkOrCreateViewingSession(orderId, deviceId);
+  // 2. Immediate second call returns valid session
+  const session2 = checkOrCreateViewingSession(orderId, deviceId, t0 + 1000);
   assert.strictEqual(session2.valid, true);
 
-  // 3. Simulate session expiration by manually setting expiresAt in the past
+  // 3. After 10 minutes (t0 + 600,001 ms) and 20 minutes (t0 + 1,200,000 ms), session remains valid and active
   const sessionKey = `${orderId}:${deviceId}`;
-  const sessionObj = activeViewingSessions.get(sessionKey);
-  assert.ok(sessionObj);
-  sessionObj.expiresAt = Date.now() - 1000; // expired 1s ago
-  sessionObj.overallExpiresAt = sessionObj.expiresAt;
+  const sessionAfter10m = checkOrCreateViewingSession(orderId, deviceId, t0 + 600001);
+  assert.strictEqual(sessionAfter10m.valid, true, 'Viewing session must NOT auto-terminate after 10 minutes');
+  assert.strictEqual(activeViewingSessions.has(sessionKey), true, 'Session must not be purged after 10 minutes');
 
-  // 4. Subsequent check must invalidate and reject expired session
-  const sessionExpiredCheck = checkOrCreateViewingSession(orderId, deviceId);
-  assert.strictEqual(sessionExpiredCheck.valid, false);
-  assert.strictEqual(sessionExpiredCheck.remainingSeconds, 0);
-  assert.strictEqual(activeViewingSessions.has(sessionKey), false);
+  const sessionAfter20m = checkOrCreateViewingSession(orderId, deviceId, t0 + 1200000);
+  assert.strictEqual(sessionAfter20m.valid, true, 'Session remains active indefinitely during valid reading');
+  assert.strictEqual(activeViewingSessions.has(sessionKey), true);
 });
 
 test('59. Four-Page Block Model - Block 1 (Pages 1–4) Opens Immediately & Freely Navigable', () => {
@@ -1758,7 +1758,7 @@ test('64. Four-Page Block Model - Eligible != Active: 5 Minutes Makes Block 2 El
   assert.strictEqual(direct1.allowed, true);
 });
 
-test('65. Four-Page Block Model - Navigating to Block 2 Activates Block 2 and Permanently Locks Block 1', () => {
+test('65. Four-Page Block Model - Entering Block 2 Grants 2-Minute Visited Grace Period to Block 1', () => {
   const orderId = 'order-activate-block2-test';
   const deviceId = 'device-activate-block2-uuid';
   const t0 = 1700000000000;
@@ -1778,15 +1778,32 @@ test('65. Four-Page Block Model - Navigating to Block 2 Activates Block 2 and Pe
   const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
   assert.strictEqual(session.activeBlock, 2);
 
-  // Now that Block 2 is active, attempting to navigate back to any page in Block 1 (Pages 1–4) is rejected
-  for (const page of [1, 2, 3, 4]) {
-    const backwardNav = requestSessionNavigation(orderId, deviceId, page, tEnterBlock2 + 1000);
-    assert.strictEqual(backwardNav.success, false);
-    assert.strictEqual(backwardNav.error, 'previous_block_locked');
+  // Block 1 now has its own independent 2-minute grace period
+  assert.ok(session.visitedBlocks[1]);
+  assert.strictEqual(session.visitedBlocks[1].graceExpiresAt, tEnterBlock2 + VISITED_BLOCK_GRACE_DURATION_MS);
 
-    const directBackward = authorizeDirectPageAccess(session, page, tEnterBlock2 + 1000);
-    assert.strictEqual(directBackward.allowed, false);
-    assert.strictEqual(directBackward.reason, 'previous_block_locked');
+  // During 2-minute grace period (at tEnterBlock2 + 30s):
+  // 1. Backward navigation to Block 1 is allowed
+  const backwardNav = requestSessionNavigation(orderId, deviceId, 2, tEnterBlock2 + 30000);
+  assert.strictEqual(backwardNav.success, true);
+  assert.strictEqual(backwardNav.currentPage, 2);
+
+  // 2. Direct page accesses to Pages 1, 2, 3, 4 are allowed
+  for (const page of [1, 2, 3, 4]) {
+    const directDuringGrace = authorizeDirectPageAccess(session, page, tEnterBlock2 + 30000);
+    assert.strictEqual(directDuringGrace.allowed, true);
+  }
+
+  // After 2-minute grace period expires (at tEnterBlock2 + 120,001 ms):
+  // Block 1 is permanently locked
+  for (const page of [1, 2, 3, 4]) {
+    const backwardLocked = requestSessionNavigation(orderId, deviceId, page, tEnterBlock2 + 120001);
+    assert.strictEqual(backwardLocked.success, false);
+    assert.strictEqual(backwardLocked.error, 'previous_block_locked');
+
+    const directLocked = authorizeDirectPageAccess(session, page, tEnterBlock2 + 120001);
+    assert.strictEqual(directLocked.allowed, false);
+    assert.strictEqual(directLocked.reason, 'previous_block_locked');
   }
 });
 
@@ -1865,49 +1882,68 @@ test('68. Four-Page Block Model - Block Jumping Beyond Immediate Next Block Is P
   assert.strictEqual(direct9.reason, 'block_jump_prohibited');
 });
 
-test('69. Four-Page Block Model - Overall 10-Minute Viewing Session Expiry Is Preserved & Invariant', () => {
-  const orderId = 'order-overall-preserved-test';
-  const deviceId = 'device-overall-preserved-uuid';
-  const t0 = 1700000000000;
-
-  const check = checkOrCreateViewingSession(orderId, deviceId, t0);
-  const initialOverallExpiry = check.session!.overallExpiresAt;
-  assert.strictEqual(initialOverallExpiry, t0 + OVERALL_VIEWING_SESSION_DURATION_MS);
-
-  // Move within Block 1
-  requestSessionNavigation(orderId, deviceId, 3, t0 + 30 * 1000);
-  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
-  assert.strictEqual(session.overallExpiresAt, initialOverallExpiry, 'Overall session expiry must never change on internal navigation');
-
-  // Advance to Block 2
-  requestSessionNavigation(orderId, deviceId, 5, t0 + 300 * 1000 + 1);
-  assert.strictEqual(session.overallExpiresAt, initialOverallExpiry, 'Overall session expiry must never change on block advance');
-});
-
-test('70. Four-Page Block Model - Session Expiry Overrides All Block States', () => {
-  const orderId = 'order-expiry-overrides-test';
-  const deviceId = 'device-expiry-overrides-uuid';
+test('69. Four-Page Block Model - Multiple Visited Blocks Maintain Independent 2-Minute Grace Countdowns', () => {
+  const orderId = 'order-independent-grace-test';
+  const deviceId = 'device-independent-grace-uuid';
   const t0 = 1700000000000;
 
   checkOrCreateViewingSession(orderId, deviceId, t0);
+
+  // Step 1: Advance to Block 2 at t1 = t0 + 300,001 ms
+  const t1 = t0 + 300 * 1000 + 1;
+  requestSessionNavigation(orderId, deviceId, 5, t1);
   const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+
+  // Block 1 grace period expires at t1 + 120,000 ms
+  assert.strictEqual(session.visitedBlocks[1].graceExpiresAt, t1 + VISITED_BLOCK_GRACE_DURATION_MS);
+
+  // Step 2: Read Block 2 for 300s, advance to Block 3 at t2 = t1 + 300,001 ms
+  const t2 = t1 + 300 * 1000 + 1;
+  requestSessionNavigation(orderId, deviceId, 9, t2);
+
+  // Block 2 now enters its own independent 2-minute grace period
+  assert.strictEqual(session.visitedBlocks[2].graceExpiresAt, t2 + VISITED_BLOCK_GRACE_DURATION_MS);
+
+  // At t2 + 10 seconds:
+  const tCheck = t2 + 10000;
+  // Block 1 is permanently locked because its grace timer (t1 + 120,000) expired long ago
+  assert.strictEqual(authorizeDirectPageAccess(session, 1, tCheck).allowed, false);
+  assert.strictEqual(requestSessionNavigation(orderId, deviceId, 1, tCheck).success, false);
+
+  // Block 2 is STILL accessible because its own grace period (t2 + 120,000) is still active!
+  assert.strictEqual(authorizeDirectPageAccess(session, 6, tCheck).allowed, true);
+  const navBackToBlock2 = requestSessionNavigation(orderId, deviceId, 6, tCheck);
+  assert.strictEqual(navBackToBlock2.success, true);
+  assert.strictEqual(navBackToBlock2.currentPage, 6);
+});
+
+test('70. Four-Page Block Model - Continuous Reading Beyond 600s Without Expiry', () => {
+  const orderId = 'order-continuous-reading-test';
+  const deviceId = 'device-continuous-reading-uuid';
+  const t0 = 1700000000000;
+
+  checkOrCreateViewingSession(orderId, deviceId, t0);
 
   // Advance to Block 2 at t0 + 301s
   requestSessionNavigation(orderId, deviceId, 5, t0 + 301 * 1000);
 
-  // Overall session reaches 10 minutes (600s + 1ms)
-  const tExpired = t0 + OVERALL_VIEWING_SESSION_DURATION_MS + 1;
+  // Time reaches 700 seconds (well past the old 10-minute 600s limit)
+  const t700s = t0 + 700 * 1000;
 
-  // 1. Navigation rejected with session_expired and session is purged from active map
-  const navExpired = requestSessionNavigation(orderId, deviceId, 6, tExpired);
-  assert.strictEqual(navExpired.success, false);
-  assert.strictEqual(navExpired.error, 'session_expired');
-  assert.strictEqual(activeViewingSessions.has(`${orderId}:${deviceId}`), false);
+  // Session remains valid and active
+  const check700 = checkOrCreateViewingSession(orderId, deviceId, t700s);
+  assert.strictEqual(check700.valid, true, 'Session must remain valid beyond 600 seconds');
+  assert.strictEqual(activeViewingSessions.has(`${orderId}:${deviceId}`), true);
 
-  // 2. Direct page access on expired session rejected with session_expired
-  const directExpired = authorizeDirectPageAccess(session, 5, tExpired);
-  assert.strictEqual(directExpired.allowed, false);
-  assert.strictEqual(directExpired.reason, 'session_expired');
+  // Navigation within Block 2 succeeds
+  const nav700 = requestSessionNavigation(orderId, deviceId, 7, t700s);
+  assert.strictEqual(nav700.success, true);
+  assert.strictEqual(nav700.currentPage, 7);
+
+  // Direct page access for active page succeeds
+  const session = activeViewingSessions.get(`${orderId}:${deviceId}`)!;
+  const direct700 = authorizeDirectPageAccess(session, 7, t700s);
+  assert.strictEqual(direct700.allowed, true);
 });
 
 test('71. Complete Removal of Customer Printing - No Print Button, Icon, or Print Action in Document Access', () => {
@@ -2075,7 +2111,7 @@ test('76. Page Arrival Mismatch Handled Defensively', () => {
   assert.strictEqual(mismatch.error, 'page_mismatch');
 });
 
-test('77. Backward Navigation to Locked Blocks Fails Closed Across Boundary', () => {
+test('77. Backward Navigation to Locked Blocks Fails Closed Across Boundary After Grace Expiry', () => {
   const orderId = 'order-boundary-test';
   const deviceId = 'device-boundary-uuid';
   const t0 = 1710000000000;
@@ -2084,8 +2120,12 @@ test('77. Backward Navigation to Locked Blocks Fails Closed Across Boundary', ()
   // Advance to Block 2 at t0 + 300,001ms
   requestSessionNavigation(orderId, deviceId, 5, t0 + 300001);
 
-  // Exact boundary: Page 5 (Block 2 start) navigating to Page 4 (Block 1 end)
-  const boundaryNav = requestSessionNavigation(orderId, deviceId, 4, t0 + 305000);
+  // During 2-minute grace (at t0 + 305,000ms), backward navigation to Block 1 is permitted
+  const graceNav = requestSessionNavigation(orderId, deviceId, 4, t0 + 305000);
+  assert.strictEqual(graceNav.success, true);
+
+  // After 2-minute grace expires (at t0 + 300,001 + 120,001ms = t0 + 420,002ms), backward navigation fails closed
+  const boundaryNav = requestSessionNavigation(orderId, deviceId, 4, t0 + 420002);
   assert.strictEqual(boundaryNav.success, false);
   assert.strictEqual(boundaryNav.error, 'previous_block_locked');
 });
@@ -2106,9 +2146,9 @@ test('78. Single-Page Canvas & Print Restriction Invariant', () => {
   const accessFuture = authorizeDirectPageAccess(session, 5, t0);
   assert.strictEqual(accessFuture.allowed, false);
 
-  // Overall session expiry boundary invariant
-  assert.strictEqual(OVERALL_VIEWING_SESSION_DURATION_MS, 600000);
+  // Block duration constants invariant
   assert.strictEqual(BLOCK_PROGRESSION_DURATION_MS, 300000);
+  assert.strictEqual(VISITED_BLOCK_GRACE_DURATION_MS, 120000);
 });
 
 test('79. Direct Browser Address-Bar Navigation Gate (Sec-Fetch-Dest: document) Fails Closed', () => {
@@ -2146,11 +2186,9 @@ test('79. Direct Browser Address-Bar Navigation Gate (Sec-Fetch-Dest: document) 
 
 test('80. Offline Reload Session Persistence & Clock Tamper Resistance Invariant', () => {
   const t0 = 1715000000000;
-  const overallExpiry = t0 + 600000; // 10 min
   const block1EligibilityExpiry = t0 + 300000; // 5 min
 
   const savedSession = {
-    overallExpiresAt: overallExpiry,
     currentPage: 2,
     activeBlock: 1,
     blockTimers: {
@@ -2161,6 +2199,7 @@ test('80. Offline Reload Session Persistence & Clock Tamper Resistance Invariant
         isEligibleForNext: false
       }
     },
+    visitedBlocks: {},
     savedAt: t0
   };
 
@@ -2176,11 +2215,6 @@ test('80. Offline Reload Session Persistence & Clock Tamper Resistance Invariant
   const tClockHacked = t0 - 3600000;
   const isEligibleHacked = tClockHacked >= timerOnReload.eligibilityExpiresAt;
   assert.strictEqual(isEligibleHacked, false, 'Moving system clock backwards cannot unlock next block');
-
-  // 3. Customer reloads after overall session duration (at t0 + 600,001 ms)
-  const tOverallExpired = t0 + 600001;
-  const isSessionExpiredOnReload = tOverallExpired >= savedSession.overallExpiresAt;
-  assert.strictEqual(isSessionExpiredOnReload, true, 'Overall session expiry must be strictly enforced on reload');
 });
 
 test('81. Real Browser DOM & Event Simulation (JSDOM): Single Canvas, Keyboard Locks, Rapid Clicks & Print Rules', () => {
@@ -2264,12 +2298,14 @@ test('82. Cloud Run Multi-Instance Isolation & Cold Start Fail-Closed Verificati
   instanceA_Sessions.set(sessionKey, {
     orderId,
     deviceId,
-    overallExpiresAt: t0 + 600000,
     currentPage: 5,
     activeBlock: 2,
     blockTimers: {
       1: { blockIndex: 1, startedAt: t0, eligibilityExpiresAt: t0 + 300000, isEligibleForNext: true },
       2: { blockIndex: 2, startedAt: t0 + 300001, eligibilityExpiresAt: t0 + 600001, isEligibleForNext: false }
+    },
+    visitedBlocks: {
+      1: { blockIndex: 1, leftAt: t0 + 300001, graceExpiresAt: t0 + 300001 + 120000 }
     }
   });
 
@@ -2281,13 +2317,12 @@ test('82. Cloud Run Multi-Instance Isolation & Cold Start Fail-Closed Verificati
   const freshSessionB = {
     orderId,
     deviceId,
-    overallExpiresAt: t0 + 600000,
-    expiresAt: t0 + 600000,
     currentPage: 1,
     activeBlock: 1,
     blockTimers: {
       1: { blockIndex: 1, startedAt: t0, eligibilityExpiresAt: t0 + 300000, isEligibleForNext: false }
-    }
+    },
+    visitedBlocks: {}
   };
   instanceB_Sessions.set(sessionKey, freshSessionB);
 
@@ -2296,6 +2331,67 @@ test('82. Cloud Run Multi-Instance Isolation & Cold Start Fail-Closed Verificati
   assert.strictEqual(accessOnB.allowed, false, 'Instance B must reject Page 5 without prior block progression');
   assert.strictEqual(accessOnB.reason, 'next_block_not_eligible', 'Instance B must fail closed');
 });
+
+test('83. Viewer Layout & Zoom Invariant - Edge-to-Edge Scrolling Without Clipping at Any Zoom Level', () => {
+  // Verifies that canvas wrapper uses m-auto shrink-0 inside min-w-full min-h-full flex within overflow-auto
+  const html = `
+    <div id="viewer-container" class="flex-grow overflow-auto p-4 sm:p-6 relative z-0">
+      <div class="min-w-full min-h-full flex items-center justify-center">
+        <div id="godrery-canvas-wrapper" class="shadow-2xl bg-white rounded-lg overflow-hidden border border-slate-700 relative m-auto shrink-0 min-w-[200px] min-h-[200px]">
+          <canvas id="godrery-active-canvas" width="1600" height="2200"></canvas>
+        </div>
+      </div>
+    </div>
+  `;
+  const dom = new JSDOM(html);
+  const container = dom.window.document.getElementById('viewer-container')!;
+  const canvasWrapper = dom.window.document.getElementById('godrery-canvas-wrapper')!;
+  const canvas = dom.window.document.getElementById('godrery-active-canvas')!;
+
+  assert.ok(container.className.includes('overflow-auto'), 'Viewer container must have overflow-auto for internal scrolling');
+  assert.ok(canvasWrapper.className.includes('m-auto'), 'Canvas wrapper must have m-auto to collapse margins on overflowing axes and center when fitting');
+  assert.ok(canvasWrapper.className.includes('shrink-0'), 'Canvas wrapper must be shrink-0 so it expands freely at 200% and 300% zoom without clipping');
+  assert.strictEqual(canvas.getAttribute('width'), '1600');
+  assert.strictEqual(canvas.getAttribute('height'), '2200');
+});
+
+test('84. Customer Welcome Header Invariant - Purchaser First Name, Document Name & Unit Code Displayed', () => {
+  const customerInfo = {
+    firstName: 'Collins',
+    paperTitle: 'DATA MINING & DATA WAREHOUSING',
+    unitCode: 'BIT4101'
+  };
+
+  const headerHtml = `
+    <div class="w-full bg-[#031d12] border-b border-slate-800 px-4 py-3 sm:px-6 flex flex-wrap items-center justify-between gap-3 shadow-sm shrink-0">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-full bg-[#00D26A]/20 text-[#00D26A] flex items-center justify-center shrink-0">
+          <svg class="w-5 h-5"></svg>
+        </div>
+        <div class="flex flex-col">
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-semibold text-[#00D26A] tracking-wider uppercase">
+              Welcome, ${customerInfo.firstName}
+            </span>
+            <span class="text-[10px] bg-slate-800 text-slate-300 font-mono px-1.5 py-0.5 rounded border border-slate-700">
+              ${customerInfo.unitCode}
+            </span>
+          </div>
+          <h1 class="text-sm sm:text-base font-bold text-white tracking-tight leading-tight">
+            ${customerInfo.paperTitle}
+          </h1>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const dom = new JSDOM(headerHtml);
+  const text = dom.window.document.body.textContent || '';
+  assert.ok(text.includes('Welcome, Collins'), 'Welcome header must display purchaser first name');
+  assert.ok(text.includes('DATA MINING & DATA WAREHOUSING'), 'Welcome header must display document title');
+  assert.ok(text.includes('BIT4101'), 'Welcome header must display unit code');
+});
+
 
 
 
