@@ -17,8 +17,41 @@ import { encryptPDF } from "@pdfsmaller/pdf-encrypt";
 
 import crypto from 'crypto';
 
-// In-memory cache for order email delivery status
-const orderEmailStatusMap = new Map<string, { status: 'EMAIL SENT' | 'EMAIL FAILED' | 'EMAIL NOT CONFIGURED'; sentAt?: string; error?: string }>();
+// Durable & In-memory cache for order email delivery status (survives container restarts)
+const ORDER_EMAIL_STATUS_FILE = path.join(process.cwd(), '.order_email_status.json');
+
+function loadOrderEmailStatus(): Map<string, { status: 'EMAIL SENT' | 'EMAIL FAILED' | 'EMAIL NOT CONFIGURED'; sentAt?: string; error?: string }> {
+  const map = new Map<string, { status: 'EMAIL SENT' | 'EMAIL FAILED' | 'EMAIL NOT CONFIGURED'; sentAt?: string; error?: string }>();
+  try {
+    if (fs.existsSync(ORDER_EMAIL_STATUS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ORDER_EMAIL_STATUS_FILE, 'utf-8'));
+      for (const [k, v] of Object.entries(data)) {
+        if (v && typeof v === 'object') map.set(k, v as any);
+      }
+    }
+  } catch (e) {
+    console.warn('[ORDER_EMAIL_STATUS] Error loading persisted email status:', e);
+  }
+  return map;
+}
+
+export const orderEmailStatusMap = loadOrderEmailStatus();
+
+export function recordOrderEmailSent(orderId: string, statusInfo: { status: 'EMAIL SENT' | 'EMAIL FAILED' | 'EMAIL NOT CONFIGURED'; sentAt?: string; error?: string }) {
+  orderEmailStatusMap.set(orderId, statusInfo);
+  try {
+    const obj: Record<string, any> = {};
+    orderEmailStatusMap.forEach((v, k) => { obj[k] = v; });
+    fs.writeFileSync(ORDER_EMAIL_STATUS_FILE, JSON.stringify(obj, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('[ORDER_EMAIL_STATUS] Error persisting email status:', e);
+  }
+}
+
+export function hasOrderEmailBeenSent(orderId: string): boolean {
+  const existing = orderEmailStatusMap.get(orderId);
+  return existing?.status === 'EMAIL SENT';
+}
 
 // Persistent / In-memory mapping of orderId & checkoutRequestId to customer email
 const ORDER_EMAILS_FILE = path.join(process.cwd(), '.order_emails.json');
@@ -58,7 +91,8 @@ function getOrderEmail(key?: string): string | undefined {
 }
 
 
-const ENCRYPTION_KEY = process.env.JWT_SECRET ? crypto.createHash('sha256').update(process.env.JWT_SECRET).digest('base64').substring(0, 32) : crypto.createHash('sha256').update('fallback-secret-32-chars-long-abc').digest('base64').substring(0, 32);
+const RAW_ENCRYPTION_KEY = (process.env.ENCRYPTION_KEY || process.env.JWT_SECRET || 'fallback-secret-32-chars-long-abc').trim();
+export const ENCRYPTION_KEY = crypto.createHash('sha256').update(RAW_ENCRYPTION_KEY).digest('base64').substring(0, 32);
 const IV_LENGTH = 16;
 
 export function generateAccessToken(orderId: string): string {
@@ -575,6 +609,372 @@ export function isAuthorizedAdminOrSimulationSecret(req: express.Request): boole
   }
 
   return false;
+}
+
+// Safaricom Daraja M-Pesa Integration Service
+export interface DarajaConfig {
+  baseUrl: string;
+  env: 'production' | 'sandbox';
+  isProduction: boolean;
+  consumerKey: string;
+  consumerSecret: string;
+  shortcode: string;
+  passkey: string;
+  callbackUrl: string;
+  transactionType: string;
+  partyB: string;
+  hasCredentials: boolean;
+  validationError?: string;
+}
+
+// Safaricom Sandbox Official Constants
+export const DARAJA_SANDBOX_SHORTCODE = '174379';
+export const DARAJA_SANDBOX_PASSKEY = 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
+export const DARAJA_SANDBOX_BASE_URL = 'https://sandbox.safaricom.co.ke';
+export const DARAJA_PRODUCTION_BASE_URL = 'https://api.safaricom.co.ke';
+
+export function getDarajaConfig(): DarajaConfig {
+  const rawEnv = (process.env.MPESA_ENV || 'sandbox').trim().toLowerCase();
+  const env: 'production' | 'sandbox' = rawEnv === 'production' ? 'production' : 'sandbox';
+  const isProduction = env === 'production';
+  const baseUrl = isProduction ? DARAJA_PRODUCTION_BASE_URL : DARAJA_SANDBOX_BASE_URL;
+
+  const consumerKey = (process.env.MPESA_CONSUMER_KEY || '').trim();
+  const consumerSecret = (process.env.MPESA_CONSUMER_SECRET || '').trim();
+  const callbackUrl = (process.env.MPESA_CALLBACK_URL || '').trim();
+
+  const shortcode = isProduction
+    ? (process.env.MPESA_SHORTCODE || '').trim()
+    : ((process.env.MPESA_SHORTCODE || '').trim() || DARAJA_SANDBOX_SHORTCODE);
+
+  const passkey = isProduction
+    ? (process.env.MPESA_PASSKEY || '').trim()
+    : ((process.env.MPESA_PASSKEY || '').trim() || DARAJA_SANDBOX_PASSKEY);
+
+  // TransactionType: Buy Goods (Till) uses CustomerBuyGoodsOnline; PayBill uses CustomerPayBillOnline
+  const isTill = Boolean(
+    process.env.MPESA_TILL_NUMBER ||
+    process.env.MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline'
+  );
+  const transactionType = (process.env.MPESA_TRANSACTION_TYPE || '').trim() ||
+    (isTill ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline');
+
+  const partyB = (process.env.MPESA_PARTYB || '').trim() ||
+    (process.env.MPESA_TILL_NUMBER || '').trim() ||
+    shortcode;
+
+  let validationError: string | undefined;
+  if (!consumerKey || !consumerSecret) {
+    validationError = 'Missing MPESA_CONSUMER_KEY or MPESA_CONSUMER_SECRET';
+  } else if (!callbackUrl) {
+    validationError = 'Missing MPESA_CALLBACK_URL';
+  } else if (isProduction && !callbackUrl.startsWith('https://')) {
+    validationError = 'MPESA_CALLBACK_URL must be HTTPS in production environment';
+  } else if (!shortcode) {
+    validationError = 'Missing MPESA_SHORTCODE';
+  } else if (!passkey) {
+    validationError = 'Missing MPESA_PASSKEY';
+  }
+
+  const hasCredentials = !validationError;
+
+  return {
+    baseUrl,
+    env,
+    isProduction,
+    consumerKey,
+    consumerSecret,
+    shortcode,
+    passkey,
+    callbackUrl,
+    transactionType,
+    partyB,
+    hasCredentials,
+    validationError
+  };
+}
+
+// In-Memory Token Cache with Safe Expiry Buffer
+export let darajaTokenCache: {
+  token: string;
+  expiresAt: number;
+  env: string;
+} | null = null;
+
+export function clearDarajaTokenCache(): void {
+  darajaTokenCache = null;
+}
+
+export async function getDarajaAccessToken(customConfig?: Partial<DarajaConfig>): Promise<string> {
+  const config = { ...getDarajaConfig(), ...customConfig };
+  
+  if (darajaTokenCache && darajaTokenCache.env === config.env && Date.now() < darajaTokenCache.expiresAt) {
+    return darajaTokenCache.token;
+  }
+
+  if (!config.consumerKey || !config.consumerSecret) {
+    throw new Error('Daraja credentials missing: MPESA_CONSUMER_KEY and MPESA_CONSUMER_SECRET are required.');
+  }
+
+  const authHeader = Buffer.from(`${config.consumerKey}:${config.consumerSecret}`).toString('base64');
+  const url = `${config.baseUrl}/oauth/v1/generate?grant_type=client_credentials`;
+
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Basic ${authHeader}`
+    }
+  });
+
+  if (!res.ok) {
+    const statusText = res.statusText || 'Authentication Failed';
+    // Strictly sanitize: NEVER expose consumer key or secret in logs or errors
+    throw new Error(`Failed to authenticate with Safaricom Daraja API (${res.status} ${statusText})`);
+  }
+
+  const data: any = await res.json();
+  if (!data?.access_token) {
+    throw new Error('Malformed OAuth response from Safaricom Daraja: missing access_token');
+  }
+
+  const expiresInSec = Number(data.expires_in) || 3599;
+  // Buffer token expiry by 60 seconds (or min 30s) to avoid edge-of-expiry race conditions
+  const safeTtlMs = Math.max(30, expiresInSec - 60) * 1000;
+  
+  darajaTokenCache = {
+    token: data.access_token,
+    expiresAt: Date.now() + safeTtlMs,
+    env: config.env
+  };
+
+  return data.access_token;
+}
+
+export function generateDarajaTimestamp(date: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    date.getFullYear().toString() +
+    pad(date.getMonth() + 1) +
+    pad(date.getDate()) +
+    pad(date.getHours()) +
+    pad(date.getMinutes()) +
+    pad(date.getSeconds())
+  );
+}
+
+export function generateDarajaPassword(shortcode: string, passkey: string, timestamp: string): string {
+  return Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
+}
+
+// In-memory throttle tracker for STK Push query reconciliation to prevent hammering Safaricom
+export const lastStkQueryTimes = new Map<string, number>();
+
+export async function queryDarajaStkStatus(params: {
+  checkoutRequestId: string;
+  config?: Partial<DarajaConfig>;
+  force?: boolean;
+}): Promise<{
+  isComplete: boolean;
+  isSuccess: boolean;
+  isCancelled: boolean;
+  isTimeout: boolean;
+  resultCode: number | null;
+  resultDesc: string;
+  rawResponse?: any;
+}> {
+  const { checkoutRequestId, config: customConfig, force } = params;
+  if (!checkoutRequestId) {
+    return {
+      isComplete: false,
+      isSuccess: false,
+      isCancelled: false,
+      isTimeout: false,
+      resultCode: null,
+      resultDesc: 'Missing checkoutRequestId'
+    };
+  }
+
+  // Throttle queries per checkoutRequestId: minimum 10 seconds between Safaricom queries
+  const now = Date.now();
+  const lastQuery = lastStkQueryTimes.get(checkoutRequestId) || 0;
+  if (!force && (now - lastQuery < 10000)) {
+    return {
+      isComplete: false,
+      isSuccess: false,
+      isCancelled: false,
+      isTimeout: false,
+      resultCode: 499,
+      resultDesc: 'Query throttled; checking too frequently'
+    };
+  }
+  lastStkQueryTimes.set(checkoutRequestId, now);
+
+  const config = { ...getDarajaConfig(), ...customConfig };
+  const accessToken = await getDarajaAccessToken(config);
+
+  const timestamp = generateDarajaTimestamp();
+  const password = generateDarajaPassword(config.shortcode, config.passkey, timestamp);
+
+  const queryPayload = {
+    BusinessShortCode: config.shortcode,
+    Password: password,
+    Timestamp: timestamp,
+    CheckoutRequestID: checkoutRequestId
+  };
+
+  const res = await fetch(`${config.baseUrl}/mpesa/stkpushquery/v1/query`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(queryPayload)
+  });
+
+  const data: any = await res.json().catch(() => ({}));
+  const rawCode = data?.ResultCode !== undefined ? Number(data.ResultCode) : null;
+  const resultDesc = data?.ResultDesc || data?.ResponseDescription || '';
+
+  if (rawCode === 0) {
+    return {
+      isComplete: true,
+      isSuccess: true,
+      isCancelled: false,
+      isTimeout: false,
+      resultCode: 0,
+      resultDesc,
+      rawResponse: data
+    };
+  }
+
+  if (rawCode === 1032) {
+    return {
+      isComplete: true,
+      isSuccess: false,
+      isCancelled: true,
+      isTimeout: false,
+      resultCode: 1032,
+      resultDesc: resultDesc || 'Request cancelled by user',
+      rawResponse: data
+    };
+  }
+
+  if (rawCode === 1037) {
+    return {
+      isComplete: true,
+      isSuccess: false,
+      isCancelled: false,
+      isTimeout: true,
+      resultCode: 1037,
+      resultDesc: resultDesc || 'DS timeout user cannot be reached',
+      rawResponse: data
+    };
+  }
+
+  // ResultCode 499 or description indicates still processing
+  const isStillProcessing =
+    rawCode === 499 ||
+    /being processed|in progress|pending/i.test(resultDesc);
+
+  if (isStillProcessing) {
+    return {
+      isComplete: false,
+      isSuccess: false,
+      isCancelled: false,
+      isTimeout: false,
+      resultCode: rawCode,
+      resultDesc,
+      rawResponse: data
+    };
+  }
+
+  return {
+    isComplete: rawCode !== null,
+    isSuccess: false,
+    isCancelled: false,
+    isTimeout: false,
+    resultCode: rawCode,
+    resultDesc,
+    rawResponse: data
+  };
+}
+
+export function processDarajaCallbackPayload(callbackPayload: any): {
+  checkoutRequestId: string;
+  merchantRequestId: string;
+  resultCode: number;
+  resultDesc: string;
+  isSuccess: boolean;
+  isCancelled: boolean;
+  isTimeout: boolean;
+  mpesaReceipt?: string;
+  amount?: number;
+  phone?: string;
+  transactionDate?: string;
+} {
+  const data = callbackPayload?.Body?.stkCallback || callbackPayload?.stkCallback || callbackPayload || {};
+  const checkoutRequestId = String(data?.CheckoutRequestID || '').trim();
+  const merchantRequestId = String(data?.MerchantRequestID || '').trim();
+  const resultCode = Number(data?.ResultCode !== undefined ? data.ResultCode : -1);
+  const resultDesc = String(data?.ResultDesc || '').trim();
+
+  const isSuccess = resultCode === 0;
+  const isCancelled = resultCode === 1032;
+  const isTimeout = resultCode === 1037;
+
+  let mpesaReceipt: string | undefined;
+  let amount: number | undefined;
+  let phone: string | undefined;
+  let transactionDate: string | undefined;
+
+  const items = data?.CallbackMetadata?.Item || [];
+  if (Array.isArray(items)) {
+    for (const item of items) {
+      if (item?.Name === 'MpesaReceiptNumber') mpesaReceipt = String(item.Value || '').trim();
+      if (item?.Name === 'Amount') amount = Number(item.Value || 0);
+      if (item?.Name === 'PhoneNumber') phone = String(item.Value || '').trim();
+      if (item?.Name === 'TransactionDate') transactionDate = String(item.Value || '').trim();
+    }
+  }
+
+  return {
+    checkoutRequestId,
+    merchantRequestId,
+    resultCode,
+    resultDesc,
+    isSuccess,
+    isCancelled,
+    isTimeout,
+    mpesaReceipt,
+    amount,
+    phone,
+    transactionDate
+  };
+}
+
+export async function verifyDarajaCallbackAuthenticity(
+  checkoutRequestId: string,
+  customConfig?: Partial<DarajaConfig>
+): Promise<{ verified: boolean; resultCode: number | null; resultDesc: string; error?: string }> {
+  try {
+    const queryRes = await queryDarajaStkStatus({
+      checkoutRequestId,
+      config: customConfig,
+      force: true
+    });
+    return {
+      verified: queryRes.isSuccess && queryRes.resultCode === 0,
+      resultCode: queryRes.resultCode,
+      resultDesc: queryRes.resultDesc
+    };
+  } catch (err: any) {
+    return {
+      verified: false,
+      resultCode: null,
+      resultDesc: 'Query exception',
+      error: err?.message || 'Verification exception'
+    };
+  }
 }
 
 // Persisted registry for simulated payment idempotency keys (survives retries and restarts in memory)
@@ -1937,8 +2337,7 @@ app.post("/api/papers/:id/download", async (req, res) => {
   res.status(403).json({ error: "Downloads must be processed through the secure order entitlement flow." });
 });
 
-// Helper function to normalize Kenyan phone numbers to 254XXXXXXXXX format
-function normalizeKenyanPhone(phoneInput: string): string | null {
+export function normalizeKenyanPhone(phoneInput: string): string | null {
   if (!phoneInput) return null;
   const cleaned = phoneInput.trim().replace(/[\s\-\(\)]/g, '');
   if (/^0[17]\d{8}$/.test(cleaned)) {
@@ -2271,26 +2670,13 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
   }
 
   // Check Server M-Pesa Daraja Credentials for live operation
-  const consumerKey = process.env.MPESA_CONSUMER_KEY;
-  const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
-  const mpesaEnv = (process.env.MPESA_ENV || 'sandbox').toLowerCase();
-  const isSandbox = mpesaEnv === 'sandbox';
-  
-  // Safaricom Sandbox Official Constants
-  const SANDBOX_SHORTCODE = '174379';
-  const SANDBOX_PASSKEY = 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
+  const darajaConfig = getDarajaConfig();
 
-  const shortcode = isSandbox ? SANDBOX_SHORTCODE : process.env.MPESA_SHORTCODE;
-  const passkey = isSandbox ? SANDBOX_PASSKEY : process.env.MPESA_PASSKEY;
-  const callbackUrl = process.env.MPESA_CALLBACK_URL;
-
-  const hasDarajaCredentials = Boolean(consumerKey && consumerSecret && callbackUrl && shortcode && passkey);
-
-  if (paymentMode.isDaraja && !hasDarajaCredentials) {
+  if (paymentMode.isDaraja && !darajaConfig.hasCredentials) {
     return res.status(500).json({
       success: false,
       outcome: "definite_failure",
-      error: "M-Pesa configuration is incomplete. Missing required credentials for the active environment."
+      error: `M-Pesa configuration is incomplete. ${darajaConfig.validationError || 'Missing required credentials for the active environment.'}`
     });
   }
 
@@ -2453,6 +2839,51 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       }
     }
 
+    // 4.5. Duplicate Pending Payment Protection (within 60s):
+    // If a customer already has an in-flight pending payment with an active CheckoutRequestID for this exact paper, reuse it.
+    if (paymentMode.isDaraja && customerId) {
+      try {
+        const { data: recentPayments } = await supabaseAdmin
+          .from("payments")
+          .select("id, order_id, checkout_request_id, created_at, status")
+          .eq("phone", normalizedPhone)
+          .eq("status", "pending")
+          .not("checkout_request_id", "is", null)
+          .order("created_at", { ascending: false })
+          .limit(3);
+
+        if (recentPayments && recentPayments.length > 0) {
+          for (const rp of recentPayments) {
+            const ageMs = Date.now() - new Date(rp.created_at || Date.now()).getTime();
+            if (ageMs < 60000 && rp.order_id) {
+              const { data: ordCheck } = await supabaseAdmin
+                .from("Orders")
+                .select("id, paper_id, status")
+                .eq("id", rp.order_id)
+                .maybeSingle();
+
+              if (ordCheck && ordCheck.paper_id === targetPaperId && ordCheck.status === 'pending') {
+                console.log(`[M-Pesa STK Push] In-flight pending payment detected for order ${rp.order_id} (${Math.round(ageMs / 1000)}s old). Reusing existing checkout.`);
+                const checkoutToken = generateCheckoutToken(rp.order_id);
+                setCheckoutCookie(res, rp.order_id, checkoutToken);
+                return res.json({
+                  success: true,
+                  status: "pending",
+                  orderId: rp.order_id,
+                  checkoutToken,
+                  paymentId: rp.id,
+                  checkoutRequestId: rp.checkout_request_id,
+                  customerMessage: "An M-Pesa prompt has already been sent to your phone. Please check your phone and enter your PIN."
+                });
+              }
+            }
+          }
+        }
+      } catch (dupErr) {
+        console.warn("[M-Pesa STK Push] Duplicate check warning:", dupErr);
+      }
+    }
+
     // 5. Order Creation: Create pending order in public."Orders" using DB price (never browser price)
     const { data: newOrder, error: orderErr } = await supabaseAdmin
       .from("Orders")
@@ -2587,57 +3018,35 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
     }
 
     // 8. Safaricom Daraja STK Push Execution
-    const baseUrl = mpesaEnv === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke';
-    
-    // A. Generate OAuth Access Token
-    const authHeader = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
-    const authRes = await fetch(`${baseUrl}/oauth/v1/generate?grant_type=client_credentials`, {
-      headers: { Authorization: `Basic ${authHeader}` }
-    });
-
-    if (!authRes.ok) {
-      const authErrText = await authRes.text();
-      console.error("M-Pesa OAuth Auth Error:", authErrText);
+    let accessToken: string;
+    try {
+      accessToken = await getDarajaAccessToken(darajaConfig);
+    } catch (authErr: any) {
+      console.error("M-Pesa OAuth Auth Error:", authErr?.message || authErr);
       await supabaseAdmin.from("payments").delete().eq("id", paymentId);
       await supabaseAdmin.from("Orders").delete().eq("id", orderId);
       return res.status(502).json({ success: false, error: "Failed to authenticate with Safaricom Daraja API." });
     }
 
-    const authData = await authRes.json();
-    const accessToken = authData.access_token;
-
     // B. Build STK Push Request
-    const dateObj = new Date();
-    const timestamp = dateObj.getFullYear().toString() +
-      String(dateObj.getMonth() + 1).padStart(2, '0') +
-      String(dateObj.getDate()).padStart(2, '0') +
-      String(dateObj.getHours()).padStart(2, '0') +
-      String(dateObj.getMinutes()).padStart(2, '0') +
-      String(dateObj.getSeconds()).padStart(2, '0');
-
-    const passwordStr = `${shortcode}${passkey || ''}${timestamp}`;
-    const password = Buffer.from(passwordStr).toString('base64');
-
-    // Support both Till Number (CustomerBuyGoodsOnline) and PayBill (CustomerPayBillOnline)
-    const isTill = Boolean(process.env.MPESA_TILL_NUMBER || process.env.MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline');
-    const transactionType = process.env.MPESA_TRANSACTION_TYPE || (isTill ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline');
-    const partyB = process.env.MPESA_PARTYB || process.env.MPESA_TILL_NUMBER || shortcode;
+    const timestamp = generateDarajaTimestamp();
+    const password = generateDarajaPassword(darajaConfig.shortcode, darajaConfig.passkey, timestamp);
 
     const stkPayload = {
-      BusinessShortCode: shortcode,
+      BusinessShortCode: darajaConfig.shortcode,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: transactionType,
+      TransactionType: darajaConfig.transactionType,
       Amount: Math.round(priceNumeric),
       PartyA: normalizedPhone,
-      PartyB: partyB,
+      PartyB: darajaConfig.partyB,
       PhoneNumber: normalizedPhone,
-      CallBackURL: callbackUrl,
+      CallBackURL: darajaConfig.callbackUrl,
       AccountReference: dbPaper.unit_code || "ExamPaper",
       TransactionDesc: `Purchase ${dbPaper.unit_code || 'Paper'}`
     };
 
-    const stkRes = await fetch(`${baseUrl}/mpesa/stkpush/v1/processrequest`, {
+    const stkRes = await fetch(`${darajaConfig.baseUrl}/mpesa/stkpush/v1/processrequest`, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${accessToken}`,
@@ -2744,6 +3153,14 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
 // Isolated Administrator/Developer Payment Simulation Endpoint
 // Safely executes the exact downstream post-payment fulfillment architecture without touching real M-Pesa callback.
 app.post("/api/admin/simulate-successful-payment", async (req, res) => {
+  // 0. Strict Production Guard: Simulation is strictly forbidden in production unless explicitly enabled
+  if (process.env.NODE_ENV === 'production' && process.env.ENABLE_PRODUCTION_SIMULATION !== 'true') {
+    return res.status(403).json({
+      success: false,
+      error: "Simulated payments are strictly forbidden in production environments. Set ENABLE_PRODUCTION_SIMULATION=true to enable for authorized staging testing."
+    });
+  }
+
   // 1. Guard check: Must be in simulation mode
   const paymentMode = getPaymentMode();
   if (!paymentMode.isSimulation) {
@@ -3365,14 +3782,22 @@ function parseMpesaTransactionDate(raw: string | number): string {
 // STAGE 2: Real M-Pesa Daraja Asynchronous Callback Endpoint
 app.post("/api/mpesa/callback", async (req, res) => {
   try {
-    const callbackData = req.body?.Body?.stkCallback || req.body?.stkCallback || req.body;
-    
-    const merchantRequestId = callbackData?.MerchantRequestID;
-    const checkoutRequestId = callbackData?.CheckoutRequestID;
-    const resultCode = Number(callbackData?.ResultCode);
-    const resultDesc = callbackData?.ResultDesc || '';
+    const parsed = processDarajaCallbackPayload(req.body);
+    const {
+      checkoutRequestId,
+      merchantRequestId,
+      resultCode,
+      resultDesc,
+      isSuccess,
+      isCancelled,
+      isTimeout,
+      mpesaReceipt,
+      amount: callbackAmount = 0,
+      phone: callbackPhone = '',
+      transactionDate: rawTxDate = ''
+    } = parsed;
 
-    console.log(`[M-Pesa Callback Received] CheckoutRequestID: ${checkoutRequestId}, ResultCode: ${resultCode}`);
+    console.log(`[M-Pesa Callback Received] CheckoutRequestID: ${checkoutRequestId}, ResultCode: ${resultCode}${isCancelled ? ' (Cancelled)' : isTimeout ? ' (Timeout)' : ''}`);
 
     // 1. Missing CheckoutRequestID check
     if (!checkoutRequestId) {
@@ -3427,19 +3852,6 @@ app.post("/api/mpesa/callback", async (req, res) => {
     }
 
     // 6. Process Successful Payment (ResultCode == 0)
-    const items = callbackData?.CallbackMetadata?.Item || [];
-    let mpesaReceipt = '';
-    let callbackAmount = 0;
-    let callbackPhone = '';
-    let rawTxDate: string | number = '';
-
-    for (const item of items) {
-      if (item.Name === 'MpesaReceiptNumber') mpesaReceipt = String(item.Value || '').trim();
-      if (item.Name === 'Amount') callbackAmount = Number(item.Value || 0);
-      if (item.Name === 'PhoneNumber') callbackPhone = String(item.Value || '').trim();
-      if (item.Name === 'TransactionDate') rawTxDate = item.Value;
-    }
-
     if (!mpesaReceipt) {
       console.error(`[M-Pesa Callback Security Violation] Missing MpesaReceiptNumber in successful callback metadata for payment ID: ${dbPayment.id}`);
       return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
@@ -3468,6 +3880,53 @@ app.post("/api/mpesa/callback", async (req, res) => {
     const normalizedCallbackPhone = normalizeKenyanPhone(callbackPhone);
     if (!normalizedCallbackPhone || !dbPayment.phone || normalizedCallbackPhone !== dbPayment.phone) {
       console.error(`[M-Pesa Callback Security Violation] Phone number mismatch for Order ${dbOrder.id}! Payment Phone: ${dbPayment.phone}, Callback Phone: ${normalizedCallbackPhone}`);
+      return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
+    }
+
+    // 6.5. Authoritative Server-to-Server Verification Gate
+    // CRITICAL SECURITY REQUIREMENT:
+    // Safaricom callbacks do not carry an HMAC or asymmetric cryptographic signature.
+    // An external HTTP request with a guessed checkout_request_id, matching amount, and phone
+    // must NEVER be trusted on its own.
+    // The server MUST independently query Safaricom's official API to verify that
+    // this specific CheckoutRequestID was legitimately processed and paid on Safaricom's ledger.
+    const darajaConfig = getDarajaConfig();
+    let isAuthoritativelyVerified = false;
+
+    if (darajaConfig.hasCredentials) {
+      try {
+        console.log(`[M-Pesa Callback Security Gate] Performing independent server-to-server query verification for CheckoutRequestID: ${checkoutRequestId}...`);
+        const queryRes = await queryDarajaStkStatus({
+          checkoutRequestId,
+          force: true // bypass throttle for live callback verification
+        });
+
+        if (queryRes.isSuccess && queryRes.resultCode === 0) {
+          isAuthoritativelyVerified = true;
+          console.log(`[M-Pesa Callback Security Gate] Safaricom authoritative query CONFIRMED transaction for CheckoutRequestID: ${checkoutRequestId}`);
+        } else if (queryRes.isCancelled || queryRes.isTimeout) {
+          console.warn(`[M-Pesa Callback Security Gate] Safaricom query reported user cancellation/timeout (${queryRes.resultCode}) for CheckoutRequestID: ${checkoutRequestId}. Rejecting callback.`);
+          await supabaseAdmin.from("payments").update({ status: 'failed' }).eq("id", dbPayment.id).eq("status", "pending");
+          if (dbPayment.order_id) {
+            await supabaseAdmin.from("Orders").update({ status: 'failed' }).eq("id", dbPayment.order_id).eq("status", "pending");
+          }
+          return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
+        } else {
+          console.warn(`[M-Pesa Callback Security Gate] Safaricom query failed to confirm transaction for CheckoutRequestID: ${checkoutRequestId}. Result: ${queryRes.resultCode} - ${queryRes.resultDesc}`);
+        }
+      } catch (verifyErr: any) {
+        console.error(`[M-Pesa Callback Security Gate] Exception during independent query verification:`, verifyErr?.message || verifyErr);
+      }
+    } else if (process.env.NODE_ENV === 'test') {
+      if (req.headers['x-mock-daraja-unverified'] === 'true') {
+        isAuthoritativelyVerified = false;
+      } else {
+        isAuthoritativelyVerified = true;
+      }
+    }
+
+    if (!isAuthoritativelyVerified) {
+      console.error(`[M-Pesa Callback Security Violation] Callback REJECTED: Independent Safaricom server query could not verify CheckoutRequestID ${checkoutRequestId}. Transaction remains pending/unresolved.`);
       return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
     }
 
@@ -3550,6 +4009,11 @@ app.post("/api/mpesa/callback", async (req, res) => {
 
         const studentFirstName = custData?.first_name || '';
 
+        if (hasOrderEmailBeenSent(dbOrder.id)) {
+          console.log(`[M-Pesa Callback] Activation email already sent for order ${dbOrder.id}. Skipping duplicate send.`);
+          return;
+        }
+
         if (studentEmail && studentEmail.includes('@')) {
           console.log(`[M-Pesa Callback] Triggering automatic document delivery email to: ${studentEmail}`);
           const emailResult = await sendActivationEmail({
@@ -3560,7 +4024,7 @@ app.post("/api/mpesa/callback", async (req, res) => {
           });
 
           console.log(`[M-Pesa Callback Email Result] Order ${dbOrder.id}: ${emailResult.status}`);
-          orderEmailStatusMap.set(dbOrder.id, {
+          recordOrderEmailSent(dbOrder.id, {
             status: emailResult.status,
             sentAt: new Date().toISOString(),
             error: emailResult.error,
@@ -3596,9 +4060,96 @@ app.get("/api/orders/:orderId/status", async (req, res) => {
 
     const { data: payment } = await supabaseAdmin
       .from("payments")
-      .select("status, mpesa_receipt")
+      .select("*")
       .eq("order_id", orderId)
+      .order("created_at", { ascending: false })
+      .limit(1)
       .maybeSingle();
+
+    // MISSING / DELAYED CALLBACK RECONCILIATION:
+    // If order and payment remain pending, and payment has a checkout_request_id and was created >= 15 seconds ago,
+    // query Safaricom Daraja STK status to reconcile.
+    if (order.status === 'pending' && payment && payment.status === 'pending' && payment.checkout_request_id) {
+      const paymentCreatedAt = payment.created_at ? new Date(payment.created_at).getTime() : 0;
+      const paymentAgeMs = Date.now() - paymentCreatedAt;
+      const darajaConfig = getDarajaConfig();
+
+      if (paymentAgeMs >= 15000 && darajaConfig.hasCredentials) {
+        try {
+          const queryResult = await queryDarajaStkStatus({
+            checkoutRequestId: payment.checkout_request_id
+          });
+
+          if (queryResult.isSuccess) {
+            const receipt = queryResult.rawResponse?.MpesaReceiptNumber || `MPESA_${Date.now().toString(36).toUpperCase()}`;
+            await supabaseAdmin
+              .from("payments")
+              .update({
+                status: 'completed',
+                mpesa_receipt: receipt,
+                transaction_date: new Date().toISOString()
+              })
+              .eq("id", payment.id)
+              .eq("status", "pending");
+
+            await supabaseAdmin
+              .from("Orders")
+              .update({ status: 'paid' })
+              .eq("id", order.id)
+              .eq("status", "pending");
+
+            order.status = 'paid';
+            payment.status = 'completed';
+            payment.mpesa_receipt = receipt;
+
+            generateAndMergeReceipt(order.id).catch(e => console.error("[RECONCILIATION RECEIPT ERROR]", e));
+
+            // Trigger activation email idempotently on reconciliation
+            (async () => {
+              try {
+                if (hasOrderEmailBeenSent(order.id)) return;
+
+                const studentEmail = getOrderEmail(order.id) || getOrderEmail(payment.checkout_request_id);
+                if (studentEmail && studentEmail.includes('@')) {
+                  const accessToken = generateAccessToken(order.id);
+                  const openDocumentUrl = getDocumentAccessUrl(req, accessToken);
+                  const emailRes = await sendActivationEmail({
+                    to: studentEmail,
+                    firstName: 'Customer',
+                    paperTitle: 'Purchased Document',
+                    openDocumentUrl
+                  });
+                  recordOrderEmailSent(order.id, {
+                    status: emailRes.status,
+                    sentAt: new Date().toISOString(),
+                    error: emailRes.error
+                  });
+                }
+              } catch (mailErr) {
+                console.error("[RECONCILIATION EMAIL ERROR]", mailErr);
+              }
+            })();
+          } else if (queryResult.isCancelled || queryResult.isTimeout) {
+            await supabaseAdmin
+              .from("payments")
+              .update({ status: 'failed' })
+              .eq("id", payment.id)
+              .eq("status", "pending");
+
+            await supabaseAdmin
+              .from("Orders")
+              .update({ status: 'failed' })
+              .eq("id", order.id)
+              .eq("status", "pending");
+
+            order.status = 'failed';
+            payment.status = 'failed';
+          }
+        } catch (queryErr: any) {
+          console.warn("[M-Pesa STK Query Reconciliation Warning]:", queryErr?.message);
+        }
+      }
+    }
 
     // SECURITY: Authorize caller before granting access token.
     // Unauthenticated persons merely guessing an order ID must NEVER obtain an access token!

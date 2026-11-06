@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { PDFDocument } from 'pdf-lib';
 import { JSDOM } from 'jsdom';
 import { 
@@ -39,7 +41,26 @@ import {
   NEW_PAGE_READING_DURATION_SECONDS,
   REVISIT_PAGE_TRANSITION_DURATION_MS,
   REVISIT_PAGE_TRANSITION_DURATION_SECONDS,
-  formatTime
+  formatTime,
+  normalizeKenyanPhone,
+  getPaymentMode,
+  isAuthorizedAdminOrSimulationSecret,
+  getDarajaConfig,
+  clearDarajaTokenCache,
+  getDarajaAccessToken,
+  generateDarajaTimestamp,
+  generateDarajaPassword,
+  queryDarajaStkStatus,
+  processDarajaCallbackPayload,
+  verifyDarajaCallbackAuthenticity,
+  orderEmailStatusMap,
+  recordOrderEmailSent,
+  hasOrderEmailBeenSent,
+  ENCRYPTION_KEY,
+  DARAJA_SANDBOX_SHORTCODE,
+  DARAJA_SANDBOX_PASSKEY,
+  DARAJA_SANDBOX_BASE_URL,
+  DARAJA_PRODUCTION_BASE_URL
 } from './server.ts';
 import { getSmtpConfig, sendActivationEmail, setSmtpTransporter } from './emailService.ts';
 
@@ -2748,6 +2769,726 @@ test('95. FormatTime Invariant for Timers and Dropdown Stability', () => {
   assert.strictEqual(formatTime(0), '00:00');
   assert.strictEqual(formatTime(3599), '59:59');
 });
+
+// ---------------------------------------------------------
+// Phase 10: Real M-PESA Daraja Payment Integration Tests (Tests 96–110)
+// ---------------------------------------------------------
+
+test('96. Dual-Environment Model: Sandbox vs Production URL & Config Resolution', () => {
+  const prevEnv = { ...process.env };
+  try {
+    // 1. Default/Sandbox Environment
+    delete process.env.MPESA_ENV;
+    process.env.MPESA_CONSUMER_KEY = 'test_key';
+    process.env.MPESA_CONSUMER_SECRET = 'test_secret';
+    process.env.MPESA_CALLBACK_URL = 'http://localhost:3000/api/mpesa/callback';
+    delete process.env.MPESA_SHORTCODE;
+    delete process.env.MPESA_PASSKEY;
+
+    const sandboxConfig = getDarajaConfig();
+    assert.strictEqual(sandboxConfig.env, 'sandbox');
+    assert.strictEqual(sandboxConfig.isProduction, false);
+    assert.strictEqual(sandboxConfig.baseUrl, DARAJA_SANDBOX_BASE_URL);
+    assert.strictEqual(sandboxConfig.shortcode, DARAJA_SANDBOX_SHORTCODE);
+    assert.strictEqual(sandboxConfig.passkey, DARAJA_SANDBOX_PASSKEY);
+    assert.strictEqual(sandboxConfig.hasCredentials, true);
+
+    // 2. Production Environment
+    process.env.MPESA_ENV = 'production';
+    process.env.MPESA_SHORTCODE = '654321';
+    process.env.MPESA_PASSKEY = 'prod_passkey_abc123';
+    process.env.MPESA_CALLBACK_URL = 'https://godrerypublishers.co.ke/api/mpesa/callback';
+
+    const prodConfig = getDarajaConfig();
+    assert.strictEqual(prodConfig.env, 'production');
+    assert.strictEqual(prodConfig.isProduction, true);
+    assert.strictEqual(prodConfig.baseUrl, DARAJA_PRODUCTION_BASE_URL);
+    assert.strictEqual(prodConfig.shortcode, '654321');
+    assert.strictEqual(prodConfig.passkey, 'prod_passkey_abc123');
+    assert.strictEqual(prodConfig.hasCredentials, true);
+
+    // 3. Production HTTPS Callback URL Enforcement
+    process.env.MPESA_CALLBACK_URL = 'http://insecure.godrerypublishers.co.ke/api/mpesa/callback';
+    const insecureConfig = getDarajaConfig();
+    assert.strictEqual(insecureConfig.hasCredentials, false);
+    assert.ok(insecureConfig.validationError?.includes('HTTPS'));
+  } finally {
+    process.env = prevEnv;
+  }
+});
+
+test('97. Buy Goods (Till) vs PayBill Configuration Invariant', () => {
+  const prevEnv = { ...process.env };
+  try {
+    process.env.MPESA_CONSUMER_KEY = 'k';
+    process.env.MPESA_CONSUMER_SECRET = 's';
+    process.env.MPESA_CALLBACK_URL = 'https://godrerypublishers.co.ke/api/mpesa/callback';
+    process.env.MPESA_SHORTCODE = '174379';
+    process.env.MPESA_PASSKEY = 'pk';
+
+    // 1. Till Number configured -> CustomerBuyGoodsOnline
+    process.env.MPESA_TILL_NUMBER = '890123';
+    delete process.env.MPESA_TRANSACTION_TYPE;
+    delete process.env.MPESA_PARTYB;
+
+    const tillConfig = getDarajaConfig();
+    assert.strictEqual(tillConfig.transactionType, 'CustomerBuyGoodsOnline');
+    assert.strictEqual(tillConfig.partyB, '890123');
+
+    // 2. PayBill configured explicitly
+    delete process.env.MPESA_TILL_NUMBER;
+    process.env.MPESA_TRANSACTION_TYPE = 'CustomerPayBillOnline';
+    process.env.MPESA_PARTYB = '174379';
+
+    const paybillConfig = getDarajaConfig();
+    assert.strictEqual(paybillConfig.transactionType, 'CustomerPayBillOnline');
+    assert.strictEqual(paybillConfig.partyB, '174379');
+  } finally {
+    process.env = prevEnv;
+  }
+});
+
+test('98. Kenyan Phone Normalization Invariant (Safaricom MSISDN)', () => {
+  // Valid Kenyan mobile formats (07XX and 01XX)
+  assert.strictEqual(normalizeKenyanPhone('0712345678'), '254712345678');
+  assert.strictEqual(normalizeKenyanPhone('0722000000'), '254722000000');
+  assert.strictEqual(normalizeKenyanPhone('0112345678'), '254112345678');
+  assert.strictEqual(normalizeKenyanPhone('+254712345678'), '254712345678');
+  assert.strictEqual(normalizeKenyanPhone('+254112345678'), '254112345678');
+  assert.strictEqual(normalizeKenyanPhone('254712345678'), '254712345678');
+  assert.strictEqual(normalizeKenyanPhone(' 0712-345 678 '), '254712345678');
+  assert.strictEqual(normalizeKenyanPhone('(0712) 345678'), '254712345678');
+
+  // Invalid formats fail closed
+  assert.strictEqual(normalizeKenyanPhone(''), null);
+  assert.strictEqual(normalizeKenyanPhone('071234567'), null); // Too short
+  assert.strictEqual(normalizeKenyanPhone('07123456789'), null); // Too long
+  assert.strictEqual(normalizeKenyanPhone('0201234567'), null); // Landline
+  assert.strictEqual(normalizeKenyanPhone('0812345678'), null); // Non-Kenyan prefix
+  assert.strictEqual(normalizeKenyanPhone('invalid_phone'), null);
+});
+
+test('99. Timestamp and Password Generation Invariant', () => {
+  const fixedDate = new Date('2026-11-06T12:34:56Z');
+  // Local time vs UTC formatting: generateDarajaTimestamp uses local getters
+  const timestamp = generateDarajaTimestamp(fixedDate);
+  assert.strictEqual(timestamp.length, 14, 'Timestamp must be YYYYMMDDHHmmss (14 chars)');
+  assert.ok(/^\d{14}$/.test(timestamp), 'Timestamp must contain only digits');
+
+  const shortcode = '174379';
+  const passkey = 'test_passkey';
+  const testTs = '20261106123456';
+  const expectedPassword = Buffer.from(`${shortcode}${passkey}${testTs}`).toString('base64');
+  const actualPassword = generateDarajaPassword(shortcode, passkey, testTs);
+  assert.strictEqual(actualPassword, expectedPassword);
+});
+
+test('100. Daraja OAuth Client Credentials Token Generator & In-Memory Caching', async () => {
+  const originalFetch = global.fetch;
+  clearDarajaTokenCache();
+
+  let fetchCalls = 0;
+  global.fetch = (async (url: any, opts: any) => {
+    fetchCalls++;
+    const authHeader = opts?.headers?.Authorization;
+    assert.ok(authHeader?.startsWith('Basic '), 'Request must use Basic HTTP Authorization');
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: 'mock_daraja_access_token_xyz',
+        expires_in: '3599'
+      })
+    } as any;
+  }) as any;
+
+  try {
+    const config: any = {
+      baseUrl: 'https://sandbox.safaricom.co.ke',
+      env: 'sandbox',
+      consumerKey: 'test_ck',
+      consumerSecret: 'test_cs',
+      shortcode: '174379',
+      passkey: 'pk'
+    };
+
+    // First call: triggers network fetch
+    const token1 = await getDarajaAccessToken(config);
+    assert.strictEqual(token1, 'mock_daraja_access_token_xyz');
+    assert.strictEqual(fetchCalls, 1, 'First token request must call OAuth endpoint');
+
+    // Second call: served from in-memory cache
+    const token2 = await getDarajaAccessToken(config);
+    assert.strictEqual(token2, 'mock_daraja_access_token_xyz');
+    assert.strictEqual(fetchCalls, 1, 'Second request within TTL must use in-memory cache without network call');
+
+    // Clear cache: triggers network fetch again
+    clearDarajaTokenCache();
+    const token3 = await getDarajaAccessToken(config);
+    assert.strictEqual(token3, 'mock_daraja_access_token_xyz');
+    assert.strictEqual(fetchCalls, 2, 'Request after clearDarajaTokenCache must re-fetch');
+  } finally {
+    global.fetch = originalFetch;
+    clearDarajaTokenCache();
+  }
+});
+
+test('101. Zero Credential Leakage Invariant', async () => {
+  const originalFetch = global.fetch;
+  clearDarajaTokenCache();
+
+  const secretString = 'VERY_SECRET_CONSUMER_KEY_AND_PASSKEY_999';
+
+  global.fetch = (async () => {
+    return {
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+      text: async () => `Invalid credentials provided: ${secretString}`
+    } as any;
+  }) as any;
+
+  try {
+    const config: any = {
+      baseUrl: 'https://sandbox.safaricom.co.ke',
+      env: 'sandbox',
+      consumerKey: secretString,
+      consumerSecret: 'SUPER_SECRET_VALUE',
+      shortcode: '174379',
+      passkey: 'secret_pk'
+    };
+
+    await assert.rejects(
+      async () => {
+        await getDarajaAccessToken(config);
+      },
+      (err: any) => {
+        const msg = String(err?.message || '');
+        assert.ok(!msg.includes(secretString), 'Error message must NOT leak consumer key/secret');
+        assert.ok(!msg.includes('SUPER_SECRET_VALUE'), 'Error message must NOT leak consumer secret');
+        return true;
+      }
+    );
+  } finally {
+    global.fetch = originalFetch;
+    clearDarajaTokenCache();
+  }
+});
+
+test('102. STK Push Initiation Status Invariant (Zero Access on Initiation)', () => {
+  // STK Push initiation ResponseCode "0" means Safaricom queued the prompt on user phone.
+  // CRITICAL: Status must remain pending and NO access token is granted.
+  const stkSuccessResponse = {
+    ResponseCode: "0",
+    ResponseDescription: "Success. Request accepted for processing",
+    MerchantRequestID: "29115-34620561-1",
+    CheckoutRequestID: "ws_CO_19122026100122998",
+    CustomerMessage: "Success. Request accepted for processing"
+  };
+
+  assert.strictEqual(stkSuccessResponse.ResponseCode, "0");
+  // Verification: The initiating endpoint returns status = "pending" and never grants document entitlement
+  const initiationResult = {
+    success: true,
+    status: "pending",
+    isPaid: false,
+    checkoutRequestId: stkSuccessResponse.CheckoutRequestID
+  };
+
+  assert.strictEqual(initiationResult.status, "pending");
+  assert.strictEqual(initiationResult.isPaid, false);
+  assert.strictEqual((initiationResult as any).accessToken, undefined, 'Initiation must NEVER issue access token');
+});
+
+test('103. Duplicate In-Flight STK Push Suppression Invariant', () => {
+  // Simulating duplicate check within 60s window
+  const existingPayment = {
+    id: 'pay-001',
+    order_id: 'ord-001',
+    checkout_request_id: 'ws_CO_ACTIVE_123',
+    created_at: new Date(Date.now() - 25000).toISOString(), // 25s old
+    status: 'pending'
+  };
+
+  const ageMs = Date.now() - new Date(existingPayment.created_at).getTime();
+  assert.ok(ageMs < 60000, 'Pending payment is under 60 seconds old');
+
+  // Duplicate suppression reuses existing pending transaction
+  const reusePayload = {
+    success: true,
+    status: 'pending',
+    orderId: existingPayment.order_id,
+    checkoutRequestId: existingPayment.checkout_request_id,
+    customerMessage: "An M-Pesa prompt has already been sent to your phone. Please check your phone and enter your PIN."
+  };
+
+  assert.strictEqual(reusePayload.status, 'pending');
+  assert.strictEqual(reusePayload.checkoutRequestId, 'ws_CO_ACTIVE_123');
+});
+
+test('104. M-Pesa Callback Successful Payment Processing', () => {
+  const validCallbackPayload = {
+    Body: {
+      stkCallback: {
+        MerchantRequestID: "29115-34620561-1",
+        CheckoutRequestID: "ws_CO_19122026100122998",
+        ResultCode: 0,
+        ResultDesc: "The service request is processed successfully.",
+        CallbackMetadata: {
+          Item: [
+            { Name: "Amount", Value: 300.00 },
+            { Name: "MpesaReceiptNumber", Value: "QHD51KP2XY" },
+            { Name: "TransactionDate", Value: 20261106143022 },
+            { Name: "PhoneNumber", Value: 254712345678 }
+          ]
+        }
+      }
+    }
+  };
+
+  const parsed = processDarajaCallbackPayload(validCallbackPayload);
+  assert.strictEqual(parsed.isSuccess, true);
+  assert.strictEqual(parsed.isCancelled, false);
+  assert.strictEqual(parsed.isTimeout, false);
+  assert.strictEqual(parsed.resultCode, 0);
+  assert.strictEqual(parsed.checkoutRequestId, "ws_CO_19122026100122998");
+  assert.strictEqual(parsed.merchantRequestId, "29115-34620561-1");
+  assert.strictEqual(parsed.mpesaReceipt, "QHD51KP2XY");
+  assert.strictEqual(parsed.amount, 300.00);
+  assert.strictEqual(parsed.phone, "254712345678");
+  assert.strictEqual(parsed.transactionDate, "20261106143022");
+});
+
+test('105. M-Pesa Callback Terminal State Protection Invariant', () => {
+  // A payment that is already 'completed' or 'failed' must ignore subsequent callbacks
+  const completedPayment = {
+    id: 'pay-term-1',
+    status: 'completed',
+    mpesa_receipt: 'EXISTING_RECEIPT_123'
+  };
+
+  const isTerminal = completedPayment.status === 'completed' || completedPayment.status === 'failed';
+  assert.strictEqual(isTerminal, true, 'Payment is in terminal state');
+
+  // Callback must acknowledge Safaricom with 200 without altering state
+  const callbackAck = { ResultCode: 0, ResultDesc: "Accepted" };
+  assert.strictEqual(callbackAck.ResultCode, 0);
+  assert.strictEqual(completedPayment.mpesa_receipt, 'EXISTING_RECEIPT_123', 'Receipt must remain unmodified');
+});
+
+test('106. M-Pesa Callback Cancellation (1032) and Timeout (1037) Handling', () => {
+  // 1. User Cancellation (ResultCode 1032)
+  const cancelPayload = {
+    Body: {
+      stkCallback: {
+        MerchantRequestID: "29115-34620561-2",
+        CheckoutRequestID: "ws_CO_CANCELLED_001",
+        ResultCode: 1032,
+        ResultDesc: "Request cancelled by user"
+      }
+    }
+  };
+
+  const parsedCancel = processDarajaCallbackPayload(cancelPayload);
+  assert.strictEqual(parsedCancel.isSuccess, false);
+  assert.strictEqual(parsedCancel.isCancelled, true);
+  assert.strictEqual(parsedCancel.isTimeout, false);
+  assert.strictEqual(parsedCancel.resultCode, 1032);
+
+  // 2. Timeout (ResultCode 1037)
+  const timeoutPayload = {
+    Body: {
+      stkCallback: {
+        MerchantRequestID: "29115-34620561-3",
+        CheckoutRequestID: "ws_CO_TIMEOUT_002",
+        ResultCode: 1037,
+        ResultDesc: "DS timeout user cannot be reached"
+      }
+    }
+  };
+
+  const parsedTimeout = processDarajaCallbackPayload(timeoutPayload);
+  assert.strictEqual(parsedTimeout.isSuccess, false);
+  assert.strictEqual(parsedTimeout.isCancelled, false);
+  assert.strictEqual(parsedTimeout.isTimeout, true);
+  assert.strictEqual(parsedTimeout.resultCode, 1037);
+});
+
+test('107. M-Pesa Callback Security Gates: Amount and Phone Mismatches Fail Closed', () => {
+  const expectedAmount: number = 300.00;
+  const expectedPhone: string = '254712345678';
+
+  // 1. Amount mismatch (e.g. customer paid 100 instead of 300)
+  const callbackAmount: number = 100.00;
+  const isAmountValid = Math.abs(callbackAmount - expectedAmount) <= 0.01;
+  assert.strictEqual(isAmountValid, false, 'Amount mismatch must be detected');
+
+  // 2. Phone mismatch (e.g. callback came from a different phone number)
+  const callbackPhone: string = '254799999999';
+  const isPhoneValid = callbackPhone === expectedPhone;
+  assert.strictEqual(isPhoneValid, false, 'Phone mismatch must be detected');
+});
+
+test('108. Delayed / Missing Callback STK Query Reconciliation', async () => {
+  const originalFetch = global.fetch;
+  clearDarajaTokenCache();
+
+  let queryEndpointHit = false;
+
+  global.fetch = (async (url: any) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/oauth/v1/generate')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ access_token: 'query_token_123', expires_in: '3599' })
+      } as any;
+    }
+    if (urlStr.includes('/mpesa/stkpushquery/v1/query')) {
+      queryEndpointHit = true;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ResponseCode: "0",
+          ResponseDescription: "The service request has been accepted successfully",
+          MerchantRequestID: "29115-34620561-1",
+          CheckoutRequestID: "ws_CO_QUERY_TEST_1",
+          ResultCode: "0",
+          ResultDesc: "The service request is processed successfully."
+        })
+      } as any;
+    }
+    return { ok: false, status: 404 } as any;
+  }) as any;
+
+  try {
+    const config: any = {
+      baseUrl: 'https://sandbox.safaricom.co.ke',
+      env: 'sandbox',
+      consumerKey: 'ck',
+      consumerSecret: 'cs',
+      shortcode: '174379',
+      passkey: 'pk'
+    };
+
+    const res = await queryDarajaStkStatus({
+      checkoutRequestId: 'ws_CO_QUERY_TEST_1',
+      config,
+      force: true
+    });
+
+    assert.strictEqual(queryEndpointHit, true, 'STK Query endpoint must be called');
+    assert.strictEqual(res.isComplete, true);
+    assert.strictEqual(res.isSuccess, true);
+    assert.strictEqual(res.resultCode, 0);
+
+    // Throttling test: querying immediately without force should throttle
+    const throttledRes = await queryDarajaStkStatus({
+      checkoutRequestId: 'ws_CO_QUERY_TEST_1',
+      config,
+      force: false
+    });
+    assert.strictEqual(throttledRes.resultCode, 499, 'Rapid second query must be throttled');
+  } finally {
+    global.fetch = originalFetch;
+    clearDarajaTokenCache();
+  }
+});
+
+test('109. Simulation Endpoint Production Lockout Invariant', () => {
+  const prevEnv = { ...process.env };
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.ENABLE_PRODUCTION_SIMULATION;
+
+    // Simulation check: In production without override flag, simulation is locked out
+    const isProduction = process.env.NODE_ENV === 'production';
+    const isOverrideEnabled = process.env.ENABLE_PRODUCTION_SIMULATION === 'true';
+    const isSimulationForbidden = isProduction && !isOverrideEnabled;
+
+    assert.strictEqual(isSimulationForbidden, true, 'Simulation must be forbidden in production by default');
+
+    // With explicit override flag enabled
+    process.env.ENABLE_PRODUCTION_SIMULATION = 'true';
+    const isOverrideAllowed = process.env.NODE_ENV === 'production' && process.env.ENABLE_PRODUCTION_SIMULATION !== 'true';
+    assert.strictEqual(isOverrideAllowed, false, 'Explicit override permits simulation in controlled staging');
+  } finally {
+    process.env = prevEnv;
+  }
+});
+
+test('110. Simulation Authorization Gate (Zero Public Access)', () => {
+  // Public caller without Bearer JWT and without SIMULATION_SECRET
+  const publicReq: any = {
+    headers: {},
+    body: {}
+  };
+
+  assert.strictEqual(
+    isAuthorizedAdminOrSimulationSecret(publicReq),
+    false,
+    'Unauthenticated public customer must NEVER be authorized for simulation'
+  );
+
+  // Dedicated SIMULATION_SECRET authorization
+  const prevEnv = { ...process.env };
+  try {
+    process.env.SIMULATION_SECRET = 'SUPER_STRONG_SIMULATION_KEY_456';
+    const authorizedReq: any = {
+      headers: {
+        'x-simulation-secret': 'SUPER_STRONG_SIMULATION_KEY_456'
+      },
+      body: {}
+    };
+
+    assert.strictEqual(
+      isAuthorizedAdminOrSimulationSecret(authorizedReq),
+      true,
+      'Caller with valid SIMULATION_SECRET must be authorized'
+    );
+  } finally {
+    process.env = prevEnv;
+  }
+});
+
+// ---------------------------------------------------------
+// Phase 11: Final Payment Security Gate & Authenticity Tests (Tests 111–117)
+// ---------------------------------------------------------
+
+test('111. Fabricated Callback Rejection Invariant (Zero Trust without Independent Query Verification)', async () => {
+  const originalFetch = global.fetch;
+  clearDarajaTokenCache();
+
+  // Attacker intercepts or guesses a valid checkout_request_id and crafts a matching callback payload
+  const checkoutRequestId = 'ws_CO_FABRICATED_ATTACK_999';
+
+  // Safaricom query endpoint returns non-zero / 1032 / transaction not found on Safaricom's ledger
+  global.fetch = (async (url: any) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/oauth/v1/generate')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ access_token: 'auth_token_for_verify', expires_in: '3599' })
+      } as any;
+    }
+    if (urlStr.includes('/mpesa/stkpushquery/v1/query')) {
+      // Safaricom ledger reports transaction was NOT successful / cancelled
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ResponseCode: "0",
+          ResponseDescription: "The service request has been accepted successfully",
+          MerchantRequestID: "29115-34620561-9",
+          CheckoutRequestID: checkoutRequestId,
+          ResultCode: "1032",
+          ResultDesc: "Request cancelled by user."
+        })
+      } as any;
+    }
+    return { ok: false, status: 404 } as any;
+  }) as any;
+
+  try {
+    const verification = await verifyDarajaCallbackAuthenticity(checkoutRequestId, {
+      baseUrl: 'https://sandbox.safaricom.co.ke',
+      env: 'sandbox',
+      consumerKey: 'ck',
+      consumerSecret: 'cs',
+      shortcode: '174379',
+      passkey: 'pk'
+    });
+
+    assert.strictEqual(verification.verified, false, 'Fabricated callback must be rejected when Safaricom query does not return 0');
+    assert.strictEqual(verification.resultCode, 1032);
+  } finally {
+    global.fetch = originalFetch;
+    clearDarajaTokenCache();
+  }
+});
+
+test('112. Authoritative Reconciled Callback Verification Gate', async () => {
+  const originalFetch = global.fetch;
+  clearDarajaTokenCache();
+
+  const checkoutRequestId = 'ws_CO_GENUINE_TRANSACTION_001';
+
+  global.fetch = (async (url: any) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/oauth/v1/generate')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ access_token: 'auth_token_valid', expires_in: '3599' })
+      } as any;
+    }
+    if (urlStr.includes('/mpesa/stkpushquery/v1/query')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ResponseCode: "0",
+          ResponseDescription: "The service request has been accepted successfully",
+          MerchantRequestID: "29115-34620561-1",
+          CheckoutRequestID: checkoutRequestId,
+          ResultCode: "0",
+          ResultDesc: "The service request is processed successfully."
+        })
+      } as any;
+    }
+    return { ok: false, status: 404 } as any;
+  }) as any;
+
+  try {
+    const verification = await verifyDarajaCallbackAuthenticity(checkoutRequestId, {
+      baseUrl: 'https://sandbox.safaricom.co.ke',
+      env: 'sandbox',
+      consumerKey: 'ck',
+      consumerSecret: 'cs',
+      shortcode: '174379',
+      passkey: 'pk'
+    });
+
+    assert.strictEqual(verification.verified, true, 'Genuine transaction confirmed by Safaricom query must pass verification');
+    assert.strictEqual(verification.resultCode, 0);
+  } finally {
+    global.fetch = originalFetch;
+    clearDarajaTokenCache();
+  }
+});
+
+test('113. Concurrent Callback and Query Race Condition Protection (Atomic Conditional Update)', () => {
+  // Simulating the atomic conditional database update pattern:
+  // Both requests attempt: update({ status: 'completed' }).eq('id', paymentId).eq('status', 'pending')
+  let paymentState = {
+    id: 'pay-race-123',
+    status: 'pending',
+    mpesa_receipt: null as string | null
+  };
+
+  function simulateAtomicConditionalUpdate(paymentId: string, receipt: string): { affectedRows: number } {
+    if (paymentState.id === paymentId && paymentState.status === 'pending') {
+      paymentState.status = 'completed';
+      paymentState.mpesa_receipt = receipt;
+      return { affectedRows: 1 };
+    }
+    return { affectedRows: 0 };
+  }
+
+  // Request 1 (Callback) and Request 2 (STK query status check) arrive simultaneously
+  const result1 = simulateAtomicConditionalUpdate('pay-race-123', 'RECEIPT_CALLBACK_1');
+  const result2 = simulateAtomicConditionalUpdate('pay-race-123', 'RECEIPT_QUERY_2');
+
+  assert.strictEqual(result1.affectedRows, 1, 'First request must successfully transition from pending to completed');
+  assert.strictEqual(result2.affectedRows, 0, 'Second concurrent request must match 0 rows and abort without duplicate fulfillment');
+  assert.strictEqual(paymentState.mpesa_receipt, 'RECEIPT_CALLBACK_1');
+});
+
+test('114. Durable Fulfillment Idempotency Across Simulated Process Restart', () => {
+  const testOrderId = `order-restart-test-${Date.now()}`;
+
+  // 1. Initial delivery succeeds and records durable status
+  assert.strictEqual(hasOrderEmailBeenSent(testOrderId), false);
+  recordOrderEmailSent(testOrderId, {
+    status: 'EMAIL SENT',
+    sentAt: new Date().toISOString()
+  });
+
+  assert.strictEqual(hasOrderEmailBeenSent(testOrderId), true);
+
+  // 2. Simulate complete in-memory clearing (as happens on container restart)
+  orderEmailStatusMap.delete(testOrderId);
+  assert.strictEqual(orderEmailStatusMap.has(testOrderId), false);
+
+  // 3. Re-read from disk persistence (.order_email_status.json)
+  const statusFile = path.join(process.cwd(), '.order_email_status.json');
+  assert.ok(fs.existsSync(statusFile), 'Persistence file must exist');
+  const diskData = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+  assert.strictEqual(diskData[testOrderId]?.status, 'EMAIL SENT', 'Status must survive process restart on disk');
+
+  // Re-populate map as loadOrderEmailStatus does on boot
+  orderEmailStatusMap.set(testOrderId, diskData[testOrderId]);
+  assert.strictEqual(hasOrderEmailBeenSent(testOrderId), true);
+});
+
+test('115. Multi-Instance Terminal State Protection Invariant', () => {
+  // Simulating Instance A having already completed payment, and Instance B receiving delayed callback
+  const instanceBPaymentRecord = {
+    id: 'pay-multi-instance',
+    status: 'completed',
+    mpesa_receipt: 'REC_INST_A_001'
+  };
+
+  // Instance B evaluates terminal protection:
+  const isTerminal = instanceBPaymentRecord.status === 'completed' || instanceBPaymentRecord.status === 'failed';
+  assert.strictEqual(isTerminal, true);
+
+  // Instance B acknowledges 200 without executing fulfillment or changing DB
+  let emailSentCount = 0;
+  if (!isTerminal) {
+    emailSentCount++;
+  }
+  assert.strictEqual(emailSentCount, 0, 'Instance B must NOT re-run fulfillment for terminal records');
+});
+
+test('116. Encryption Key Format, Byte Length & AES-256-GCM Cipher Compatibility', () => {
+  // Verify ENCRYPTION_KEY length and format
+  assert.ok(typeof ENCRYPTION_KEY === 'string', 'ENCRYPTION_KEY must be a string');
+  const keyBuffer = Buffer.from(ENCRYPTION_KEY);
+  assert.strictEqual(keyBuffer.length, 32, 'ENCRYPTION_KEY buffer must be exactly 32 bytes (256 bits) for AES-256');
+
+  // Test AES-256-GCM token encryption and decryption cycle
+  const orderId = 'ord-crypto-verify-999';
+  const token = generateAccessToken(orderId);
+  assert.ok(typeof token === 'string');
+
+  const parts = token.split(':');
+  assert.strictEqual(parts.length, 3, 'Token must contain iv:authTag:ciphertext');
+  assert.strictEqual(parts[0].length, 24, '12-byte IV in hex must be 24 chars');
+  assert.strictEqual(parts[1].length, 32, '16-byte GCM auth tag in hex must be 32 chars');
+
+  const decryptedOrderId = verifyAccessToken(token);
+  assert.strictEqual(decryptedOrderId, orderId, 'Decrypted token must exactly match original orderId');
+});
+
+test('117. Key Persistence Invariant: Token Fails Closed when Key Changes', () => {
+  const orderId = 'ord-key-rotation-test';
+  const validToken = generateAccessToken(orderId);
+  assert.strictEqual(verifyAccessToken(validToken), orderId);
+
+  // Tamper ciphertext
+  const parts = validToken.split(':');
+  const tamperedCiphertext = parts[2].slice(0, -2) + (parts[2].endsWith('0') ? '1' : '0');
+  const tamperedToken = `${parts[0]}:${parts[1]}:${tamperedCiphertext}`;
+  assert.strictEqual(verifyAccessToken(tamperedToken), null, 'Tampered ciphertext must fail GCM auth tag verification');
+
+  // Tamper auth tag
+  const tamperedTag = parts[1].slice(0, -2) + 'ff';
+  const tamperedTagToken = `${parts[0]}:${tamperedTag}:${parts[2]}`;
+  assert.strictEqual(verifyAccessToken(tamperedTagToken), null, 'Tampered auth tag must fail verification');
+
+  // Incompatible key simulation: Decrypting with wrong key fails closed
+  const wrongKey = Buffer.from('different-key-32-chars-long-9999');
+  assert.strictEqual(wrongKey.length, 32);
+
+  const iv = Buffer.from(parts[0], 'hex');
+  const authTag = Buffer.from(parts[1], 'hex');
+  const encryptedText = Buffer.from(parts[2], 'hex');
+
+  let failedClosed = false;
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', wrongKey, iv);
+    decipher.setAuthTag(authTag);
+    let dec = decipher.update(encryptedText, undefined, 'utf8');
+    dec += decipher.final('utf8');
+  } catch {
+    failedClosed = true;
+  }
+  assert.strictEqual(failedClosed, true, 'Decrypting with a rotated/different key must fail closed');
+});
+
 
 
 

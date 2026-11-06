@@ -1573,7 +1573,7 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-500">Amount:</span>
-                <span className="font-bold text-emerald-700">{finalAmount === 0 ? "FREE" : selectedPaper.price}</span>
+                <span className="font-bold text-emerald-700">{finalAmount === 0 ? "FREE" : `KSh ${finalAmount}`}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-500">M-Pesa Phone:</span>
@@ -1592,7 +1592,11 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
 
             <button
               type="button"
-              onClick={() => setStep(3)}
+              onClick={() => {
+                submittingRef.current = false;
+                setIsInitiatingPayment(false);
+                setStep(3);
+              }}
               className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold rounded-xl text-xs transition-colors"
             >
               Change Details / Retry
