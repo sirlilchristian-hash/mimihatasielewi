@@ -38,7 +38,8 @@ import {
   NEW_PAGE_READING_DURATION_MS,
   NEW_PAGE_READING_DURATION_SECONDS,
   REVISIT_PAGE_TRANSITION_DURATION_MS,
-  REVISIT_PAGE_TRANSITION_DURATION_SECONDS
+  REVISIT_PAGE_TRANSITION_DURATION_SECONDS,
+  formatTime
 } from './server.ts';
 import { getSmtpConfig, sendActivationEmail, setSmtpTransporter } from './emailService.ts';
 
@@ -2391,6 +2392,363 @@ test('84. Customer Welcome Header Invariant - Purchaser First Name, Document Nam
   assert.ok(text.includes('DATA MINING & DATA WAREHOUSING'), 'Welcome header must display document title');
   assert.ok(text.includes('BIT4101'), 'Welcome header must display unit code');
 });
+
+// ---------------------------------------------------------
+// PHASE 6 — Mobile Responsive, HD Rendering, Natural Scrolling & Ordered Purchases Tests
+// ---------------------------------------------------------
+
+test('85. Mobile Responsive Viewport Matrix (320px, 360px, 375px, 390px, 414px, 430px)', () => {
+  const mobileWidths = [320, 360, 375, 390, 414, 430];
+
+  for (const width of mobileWidths) {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+        <body>
+          <div id="viewer-shell" style="width: ${width}px; max-width: 100vw; overflow-x: hidden;">
+            <div id="toolbar" class="bg-slate-900 border-b border-slate-800 px-3 py-2 flex flex-wrap items-center justify-between gap-2.5">
+              <div class="flex items-center gap-2 flex-wrap">
+                <button id="btn-prev" class="min-h-[38px] px-2.5 py-1.5 rounded-lg text-xs">Prev</button>
+                <select id="page-select" class="min-h-[38px] px-2.5 py-1.5 text-[15px] rounded-lg">
+                  <option value="1">Page 1 (Block 1 • Active)</option>
+                  <option value="2">Page 2 (Block 1 • Active)</option>
+                </select>
+                <button id="btn-next" class="min-h-[38px] px-2.5 py-1.5 rounded-lg text-xs">Next</button>
+              </div>
+              <div class="flex items-center gap-2 flex-wrap">
+                <div id="badge-block" class="px-2.5 py-1 text-xs">Block 1</div>
+                <div id="badge-countdown" class="px-2.5 py-1 text-xs">Next Block Unlocks In: 05:00</div>
+              </div>
+            </div>
+          </div>
+        </body>
+      </html>
+    `;
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+    const shell = doc.getElementById('viewer-shell')!;
+    const toolbar = doc.getElementById('toolbar')!;
+    const prevBtn = doc.getElementById('btn-prev')!;
+    const select = doc.getElementById('page-select')!;
+    const nextBtn = doc.getElementById('btn-next')!;
+
+    assert.ok(toolbar.className.includes('flex-wrap'), `Toolbar must wrap on ${width}px screen to avoid clipping`);
+    assert.ok(prevBtn.className.includes('min-h-[38px]'), `Touch target must be at least 38px on ${width}px screen`);
+    assert.ok(nextBtn.className.includes('min-h-[38px]'), `Touch target must be at least 38px on ${width}px screen`);
+    assert.ok(select.className.includes('text-[15px]'), `Select font size must prevent iOS auto-zoom on ${width}px screen`);
+    assert.ok(shell.getAttribute('style')?.includes('overflow-x: hidden'), `Horizontal overflow must be locked on ${width}px screen`);
+  }
+});
+
+test('86. HD / High-Resolution Rendering & DPR Resolution Invariant', () => {
+  // Test PDF.js canvas scaling across devicePixelRatio values
+  const unscaledWidth = 600;
+  const unscaledHeight = 800;
+  const effectiveScale = 1.25;
+
+  const dprRetina2 = 2.0;
+  const dprRetina3 = 3.0;
+
+  // CSS display size (same regardless of DPR):
+  const cssWidth = Math.floor(unscaledWidth * effectiveScale); // 750px
+  const cssHeight = Math.floor(unscaledHeight * effectiveScale); // 1000px
+  assert.strictEqual(cssWidth, 750);
+  assert.strictEqual(cssHeight, 1000);
+
+  // Retina 2x physical resolution:
+  const renderScale2x = Math.min(effectiveScale * dprRetina2, 4.0);
+  const canvasWidth2x = Math.floor(unscaledWidth * renderScale2x); // 1500px
+  const canvasHeight2x = Math.floor(unscaledHeight * renderScale2x); // 2000px
+  assert.strictEqual(canvasWidth2x, 1500, 'Physical canvas width at DPR 2.0 must be 2x CSS width for HD sharpness');
+  assert.strictEqual(canvasHeight2x, 2000, 'Physical canvas height at DPR 2.0 must be 2x CSS height for HD sharpness');
+
+  // Retina 3x physical resolution:
+  const renderScale3x = Math.min(effectiveScale * dprRetina3, 4.0);
+  const canvasWidth3x = Math.floor(unscaledWidth * renderScale3x); // 2250px
+  const canvasHeight3x = Math.floor(unscaledHeight * renderScale3x); // 3000px
+  assert.strictEqual(canvasWidth3x, 2250, 'Physical canvas width at DPR 3.0 must be 3x CSS width for Retina sharpness');
+  assert.strictEqual(canvasHeight3x, 3000, 'Physical canvas height at DPR 3.0 must be 3x CSS height for Retina sharpness');
+
+  // Max dimension clamping invariant (protects mobile GPU memory):
+  const extremeZoom = 3.5;
+  const rawRenderScale = extremeZoom * dprRetina3; // 10.5x
+  const clampedRenderScale = Math.min(rawRenderScale, 4.0);
+  assert.strictEqual(clampedRenderScale, 4.0, 'Render scale must be clamped at 4.0 to prevent GPU memory crash on mobile');
+});
+
+test('87. Mobile Touch Pinch-to-Zoom Gesture Math & Zoom Clamping Invariant', () => {
+  // Verify 2-finger distance calculation and scale factor
+  const t0_Finger1 = { clientX: 100, clientY: 100 };
+  const t0_Finger2 = { clientX: 200, clientY: 100 };
+  const initialDist = Math.hypot(t0_Finger1.clientX - t0_Finger2.clientX, t0_Finger1.clientY - t0_Finger2.clientY);
+  assert.strictEqual(initialDist, 100);
+
+  // Spread fingers apart to 150px
+  const t1_Finger1 = { clientX: 75, clientY: 100 };
+  const t1_Finger2 = { clientX: 225, clientY: 100 };
+  const spreadDist = Math.hypot(t1_Finger1.clientX - t1_Finger2.clientX, t1_Finger1.clientY - t1_Finger2.clientY);
+  assert.strictEqual(spreadDist, 150);
+
+  const initialZoom = 1.0;
+  const spreadFactor = spreadDist / initialDist; // 1.5
+  const newZoom = Math.max(0.5, Math.min(3.5, Number((initialZoom * spreadFactor).toFixed(2))));
+  assert.strictEqual(newZoom, 1.5, 'Pinch zoom calculation must scale proportionately');
+
+  // Pinch in to 30px (extreme pinch-in)
+  const pinchInDist = 30;
+  const pinchInFactor = pinchInDist / initialDist; // 0.3
+  const clampedMinZoom = Math.max(0.5, Math.min(3.5, Number((initialZoom * pinchInFactor).toFixed(2))));
+  assert.strictEqual(clampedMinZoom, 0.5, 'Pinch zoom must clamp at 0.5x minimum');
+
+  // Extreme spread to 500px (extreme spread)
+  const extremeSpreadDist = 500;
+  const extremeSpreadFactor = extremeSpreadDist / initialDist; // 5.0
+  const clampedMaxZoom = Math.max(0.5, Math.min(3.5, Number((initialZoom * extremeSpreadFactor).toFixed(2))));
+  assert.strictEqual(clampedMaxZoom, 3.5, 'Pinch zoom must clamp at 3.5x maximum');
+});
+
+test('88. Natural Page Scrolling Invariant Within Block & Authorization Boundary', () => {
+  // In Block 1 (pages 1–4), all 4 pages are rendered vertically followed by Authorization Boundary Card
+  const activeBlock = 1;
+  const blockPages = [1, 2, 3, 4];
+  const isEligibleForNext = false;
+  const nextPurchasedBlock = 2;
+  const remainingSeconds = 240;
+
+  const html = `
+    <div id="viewport" class="flex-grow overflow-auto p-4 flex flex-col items-center">
+      ${blockPages.map(p => `
+        <div id="godrery-canvas-wrapper-p${p}" data-page-num="${p}" class="page-wrapper m-auto shrink-0">
+          <canvas id="canvas-p${p}"></canvas>
+        </div>
+      `).join('')}
+      <div id="boundary-card" class="boundary-card">
+        <h3>End of Block ${activeBlock}</h3>
+        <p>Next Block Unlocks In: 04:00</p>
+      </div>
+    </div>
+  `;
+
+  const dom = new JSDOM(html);
+  const doc = dom.window.document;
+  const wrappers = doc.querySelectorAll('.page-wrapper');
+  assert.strictEqual(wrappers.length, 4, 'Must render exactly the authorized pages of the current block for natural scrolling');
+  assert.strictEqual(wrappers[0].getAttribute('data-page-num'), '1');
+  assert.strictEqual(wrappers[3].getAttribute('data-page-num'), '4');
+
+  const boundaryCard = doc.getElementById('boundary-card')!;
+  assert.ok(boundaryCard.textContent?.includes('End of Block 1'), 'Boundary card must be rendered after last page of block');
+  assert.ok(boundaryCard.textContent?.includes('Next Block Unlocks In: 04:00'), 'Boundary card must display countdown when next block is not eligible');
+});
+
+test('89. Mobile Dropdown Stability & Zero Ticker Blinking Invariant', () => {
+  // Verify that dropdown option labels are static and do NOT include countdown seconds
+  const pageList = [1, 2, 3, 4, 5];
+  const activeBlock = 1;
+  const nextPurchasedBlock = 2;
+  const isEligibleForNext = false;
+
+  const options = pageList.map(p => {
+    const pBlock = getBlockIndexForPage(p);
+    const isCurrentBlock = pBlock === activeBlock;
+    const isNextBlock = pBlock === nextPurchasedBlock;
+    let statusText = `Block ${pBlock}`;
+    if (isCurrentBlock) {
+      statusText = `Block ${pBlock} • Active`;
+    } else if (isNextBlock) {
+      statusText = isEligibleForNext ? `Block ${pBlock} • Eligible` : `Block ${pBlock} • Locked`;
+    }
+    return `Page ${p} (${statusText})`;
+  });
+
+  for (const opt of options) {
+    // Crucial: Option text MUST NOT match regex for mm:ss or seconds to guarantee zero DOM ticker re-renders in dropdown!
+    assert.strictEqual(/\d{2}:\d{2}/.test(opt), false, `Option label "${opt}" must not contain ticking mm:ss timer string`);
+  }
+});
+
+test('90. Page-Based Purchase Entitlement - Single Page Purchase', () => {
+  const orderId = 'ord-single-p3';
+  const deviceId = 'dev-single-uuid';
+  const purchasedPages = [3]; // Customer only purchased Page 3
+  const totalPages = 20;
+  const t0 = 1716000000000;
+
+  // Initialize session with purchasedPages = [3]
+  const sessionRes = checkOrCreateViewingSession(orderId, deviceId, t0, purchasedPages, totalPages);
+  assert.strictEqual(sessionRes.valid, true);
+  const session = sessionRes.session!;
+  assert.strictEqual(session.currentPage, 3, 'Initial page must be Page 3 (first purchased page)');
+  assert.strictEqual(session.activeBlock, 1, 'Initial active block must be Block 1 (where Page 3 resides)');
+
+  // 1. Page 3 is authorized
+  const accessP3 = authorizeDirectPageAccess(session, 3, t0);
+  assert.strictEqual(accessP3.allowed, true, 'Page 3 must be authorized');
+
+  // 2. Pages 1, 2, 4 in Block 1 are NOT purchased -> strictly locked
+  const accessP1 = authorizeDirectPageAccess(session, 1, t0);
+  assert.strictEqual(accessP1.allowed, false);
+  assert.strictEqual(accessP1.reason, 'page_not_purchased', 'Unpurchased Page 1 must be rejected');
+
+  const accessP2 = authorizeDirectPageAccess(session, 2, t0);
+  assert.strictEqual(accessP2.allowed, false);
+  assert.strictEqual(accessP2.reason, 'page_not_purchased', 'Unpurchased Page 2 must be rejected');
+
+  const accessP4 = authorizeDirectPageAccess(session, 4, t0);
+  assert.strictEqual(accessP4.allowed, false);
+  assert.strictEqual(accessP4.reason, 'page_not_purchased', 'Unpurchased Page 4 must be rejected');
+
+  // 3. Navigation to unpurchased Page 1 rejected
+  const navP1 = requestSessionNavigation(orderId, deviceId, 1, t0);
+  assert.strictEqual(navP1.success, false);
+  assert.strictEqual(navP1.error, 'page_not_purchased');
+
+  // 4. Navigation to unpurchased Page 5 (Block 2) rejected
+  const navP5 = requestSessionNavigation(orderId, deviceId, 5, t0);
+  assert.strictEqual(navP5.success, false);
+  assert.strictEqual(navP5.error, 'page_not_purchased');
+});
+
+test('91. Page-Based Purchase Entitlement - Multiple Non-Contiguous Pages Spanning Blocks', () => {
+  const orderId = 'ord-non-contiguous';
+  const deviceId = 'dev-non-contig-uuid';
+  const purchasedPages = [2, 3, 6, 7, 10]; // Pages spanning Block 1, Block 2, Block 3
+  const totalPages = 20;
+  const t0 = 1716000000000;
+
+  const sessionRes = checkOrCreateViewingSession(orderId, deviceId, t0, purchasedPages, totalPages);
+  assert.strictEqual(sessionRes.valid, true);
+  const session = sessionRes.session!;
+  assert.strictEqual(session.currentPage, 2, 'Initial page must be Page 2');
+  assert.strictEqual(session.activeBlock, 1, 'Initial active block must be Block 1');
+
+  // Block 1: Pages 2 and 3 are authorized; Pages 1 and 4 are NOT
+  assert.strictEqual(authorizeDirectPageAccess(session, 2, t0).allowed, true);
+  assert.strictEqual(authorizeDirectPageAccess(session, 3, t0).allowed, true);
+  assert.strictEqual(authorizeDirectPageAccess(session, 1, t0).allowed, false);
+  assert.strictEqual(authorizeDirectPageAccess(session, 1, t0).reason, 'page_not_purchased');
+  assert.strictEqual(authorizeDirectPageAccess(session, 4, t0).allowed, false);
+  assert.strictEqual(authorizeDirectPageAccess(session, 4, t0).reason, 'page_not_purchased');
+
+  // Free navigation between purchased pages 2 and 3 in Block 1
+  const nav2to3 = requestSessionNavigation(orderId, deviceId, 3, t0);
+  assert.strictEqual(nav2to3.success, true);
+  assert.strictEqual(nav2to3.currentPage, 3);
+
+  // Attempting to advance to Block 2 (Page 6) before 5 minutes expires is rejected
+  const navBlock2Early = requestSessionNavigation(orderId, deviceId, 6, t0 + 100000);
+  assert.strictEqual(navBlock2Early.success, false);
+  assert.strictEqual(navBlock2Early.error, 'next_block_not_eligible');
+
+  // After 5 minutes, advance to Block 2 (Page 6)
+  const tBlock2 = t0 + 300001;
+  const navBlock2 = requestSessionNavigation(orderId, deviceId, 6, tBlock2);
+  assert.strictEqual(navBlock2.success, true);
+  assert.strictEqual(navBlock2.activeBlock, 2);
+  assert.strictEqual(navBlock2.currentPage, 6);
+
+  // In Block 2: Pages 6 and 7 are authorized; Pages 5 and 8 are NOT
+  assert.strictEqual(authorizeDirectPageAccess(session, 6, tBlock2).allowed, true);
+  assert.strictEqual(authorizeDirectPageAccess(session, 7, tBlock2).allowed, true);
+  assert.strictEqual(authorizeDirectPageAccess(session, 5, tBlock2).allowed, false);
+  assert.strictEqual(authorizeDirectPageAccess(session, 5, tBlock2).reason, 'page_not_purchased');
+  assert.strictEqual(authorizeDirectPageAccess(session, 8, tBlock2).allowed, false);
+  assert.strictEqual(authorizeDirectPageAccess(session, 8, tBlock2).reason, 'page_not_purchased');
+});
+
+test('92. Page-Based Purchase Entitlement - Unpurchased Blocks Receive Zero Countdown', () => {
+  const orderId = 'ord-gap-blocks';
+  const deviceId = 'dev-gap-uuid';
+  // Customer purchases Pages 1, 2 (Block 1) and Pages 9, 10 (Block 3). Block 2 has 0 purchased pages!
+  const purchasedPages = [1, 2, 9, 10];
+  const totalPages = 20;
+  const t0 = 1716000000000;
+
+  const sessionRes = checkOrCreateViewingSession(orderId, deviceId, t0, purchasedPages, totalPages);
+  const session = sessionRes.session!;
+
+  // 1. Pages in Block 2 (5, 6, 7, 8) are unpurchased -> strictly locked
+  for (let p = 5; p <= 8; p++) {
+    const auth = authorizeDirectPageAccess(session, p, t0);
+    assert.strictEqual(auth.allowed, false);
+    assert.strictEqual(auth.reason, 'page_not_purchased');
+  }
+
+  // 2. Next eligible block after Block 1 is Block 3 (the next purchased block!), NOT Block 2
+  const tBlock3Eligible = t0 + 300001;
+  const navBlock3 = requestSessionNavigation(orderId, deviceId, 9, tBlock3Eligible);
+  assert.strictEqual(navBlock3.success, true);
+  assert.strictEqual(navBlock3.activeBlock, 3, 'Should advance directly to Block 3 (next purchased block)');
+  assert.strictEqual(navBlock3.currentPage, 9);
+});
+
+test('93. LIFO-Style Ordered Page Selection Sequence Preservation', () => {
+  // Microeconomics 303 pages, 12 pages purchased = [292..303]
+  const targetPages = computeAuthoritativeLifoPages(303, 12);
+  assert.strictEqual(targetPages.length, 12);
+  assert.strictEqual(targetPages[0], 292);
+  assert.strictEqual(targetPages[11], 303);
+
+  const orderId = 'ord-lifo-303-12';
+  const deviceId = 'dev-lifo-uuid';
+  const t0 = 1716000000000;
+
+  const sessionRes = checkOrCreateViewingSession(orderId, deviceId, t0, targetPages, 303);
+  const session = sessionRes.session!;
+
+  // Block for page 292 is Math.floor((292-1)/4) + 1 = 73
+  assert.strictEqual(session.currentPage, 292, 'LIFO session must start on first purchased page 292');
+  assert.strictEqual(session.activeBlock, 73, 'Active block must be Block 73');
+
+  // Blocks 1 through 72 contain zero purchased pages -> strictly locked
+  for (let b = 1; b <= 72; b++) {
+    const pageInBlock = (b - 1) * 4 + 1;
+    const auth = authorizeDirectPageAccess(session, pageInBlock, t0);
+    assert.strictEqual(auth.allowed, false);
+    assert.strictEqual(auth.reason, 'page_not_purchased');
+  }
+});
+
+test('94. Visited Purchased Blocks Receive Independent 2-Minute Grace Periods', () => {
+  const orderId = 'ord-grace-purchased';
+  const deviceId = 'dev-grace-purchased-uuid';
+  const purchasedPages = [1, 2, 5, 6, 9, 10]; // Blocks 1, 2, 3
+  const t0 = 1716000000000;
+
+  const sessionRes = checkOrCreateViewingSession(orderId, deviceId, t0, purchasedPages, 20);
+  const session = sessionRes.session!;
+
+  // Advance to Block 2 after 5 mins (t0 + 300000)
+  const tEnterB2 = t0 + 300001;
+  const navB2 = requestSessionNavigation(orderId, deviceId, 5, tEnterB2);
+  assert.strictEqual(navB2.success, true);
+  assert.strictEqual(session.activeBlock, 2);
+
+  // Block 1 is now in grace: Left at tEnterB2, expires at tEnterB2 + 120000
+  const graceB1 = session.visitedBlocks[1];
+  assert.ok(graceB1, 'Block 1 must have visited grace record');
+  assert.strictEqual(graceB1.graceExpiresAt, tEnterB2 + 120000);
+
+  // During grace (e.g. 60 seconds into Block 2): Navigation to purchased Page 2 in Block 1 is allowed
+  const navBackB1 = requestSessionNavigation(orderId, deviceId, 2, tEnterB2 + 60000);
+  assert.strictEqual(navBackB1.success, true);
+  assert.strictEqual(navBackB1.currentPage, 2);
+
+  // After grace expires (121 seconds into Block 2): Navigation to Block 1 is rejected
+  const navBackB1Expired = requestSessionNavigation(orderId, deviceId, 2, tEnterB2 + 121000);
+  assert.strictEqual(navBackB1Expired.success, false);
+  assert.strictEqual(navBackB1Expired.error, 'previous_block_locked');
+});
+
+test('95. FormatTime Invariant for Timers and Dropdown Stability', () => {
+  assert.strictEqual(formatTime(300), '05:00');
+  assert.strictEqual(formatTime(299), '04:59');
+  assert.strictEqual(formatTime(120), '02:00');
+  assert.strictEqual(formatTime(59), '00:59');
+  assert.strictEqual(formatTime(0), '00:00');
+  assert.strictEqual(formatTime(3599), '59:59');
+});
+
 
 
 

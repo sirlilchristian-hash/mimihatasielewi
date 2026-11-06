@@ -4162,7 +4162,7 @@ app.post("/api/document/verify", async (req, res) => {
     // Authoritative check: order must exist and be paid
     const { data: order, error: orderErr } = await supabaseAdmin
       .from('Orders')
-      .select('id, status, paper_id, customers(first_name, second_name)')
+      .select('id, status, paper_id, purchased_pages, page_quantity, customers(first_name, second_name)')
       .eq('id', orderId)
       .maybeSingle();
 
@@ -4172,16 +4172,32 @@ app.post("/api/document/verify", async (req, res) => {
 
     let paperTitle = 'Protected Document';
     let unitCode = '';
+    let totalPages = 0;
     if (order.paper_id) {
       const { data: paper } = await supabaseAdmin
         .from('Papers')
-        .select('paper_title, unit_code')
+        .select('paper_title, unit_code, total_pages')
         .eq('id', order.paper_id)
         .maybeSingle();
       if (paper) {
         paperTitle = paper.paper_title || paperTitle;
         unitCode = paper.unit_code || '';
+        totalPages = Number(paper.total_pages) || 0;
       }
+    }
+
+    let purchasedPages: number[] | null = null;
+    if (order.purchased_pages) {
+      let raw = order.purchased_pages;
+      if (typeof raw === 'string') {
+        try { raw = JSON.parse(raw); } catch {}
+      }
+      if (Array.isArray(raw)) {
+        purchasedPages = raw.map(p => Number(p)).filter(p => Number.isInteger(p) && p >= 1);
+      }
+    }
+    if ((!purchasedPages || purchasedPages.length === 0) && totalPages > 0) {
+      purchasedPages = Array.from({ length: totalPages }, (_, i) => i + 1);
     }
 
     const cust = Array.isArray(order.customers) ? order.customers[0] : order.customers;
@@ -4198,12 +4214,16 @@ app.post("/api/document/verify", async (req, res) => {
         const sess = activeViewingSessions.get(`${orderId}:${deviceId}`);
         if (sess) {
             sess.customerInfo = { firstName, paperTitle, unitCode };
+            if (purchasedPages && !sess.purchasedPages) sess.purchasedPages = purchasedPages;
+            if (totalPages && !sess.totalPages) sess.totalPages = totalPages;
         }
         return res.json({ 
             success: true,
             firstName,
             paperTitle,
-            unitCode
+            unitCode,
+            purchasedPages,
+            totalPages
         });
     }
     
@@ -4220,7 +4240,7 @@ app.post("/api/document/verify", async (req, res) => {
 
     const currentCount = getDistinctDeviceCount(devices);
     if (currentCount < limit) {
-        return res.json({ requireNames: true, firstName, paperTitle, unitCode });
+        return res.json({ requireNames: true, firstName, paperTitle, unitCode, purchasedPages, totalPages });
     } else {
         return res.json({ error: `Device limit reached. This document has already been registered on ${limit} devices.` });
     }
@@ -4342,11 +4362,18 @@ export function getBlockIndexForPage(page: number): number {
   return Math.floor((page - 1) / BLOCK_PAGE_SIZE) + 1;
 }
 
-export function getBlockPageRange(blockIndex: number): { startPage: number; endPage: number } {
+export function getBlockPageRange(blockIndex: number, totalPages?: number): { startPage: number; endPage: number } {
   const safeBlock = Math.max(1, blockIndex);
   const startPage = (safeBlock - 1) * BLOCK_PAGE_SIZE + 1;
-  const endPage = safeBlock * BLOCK_PAGE_SIZE;
+  const maxPage = totalPages || 9999;
+  const endPage = Math.min(safeBlock * BLOCK_PAGE_SIZE, maxPage);
   return { startPage, endPage };
+}
+
+export function formatTime(secs: number): string {
+  const mins = Math.floor(secs / 60);
+  const rem = secs % 60;
+  return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
 }
 
 export interface BlockTimerState {
@@ -4376,11 +4403,19 @@ export interface ViewingSessionData {
     paperTitle?: string;
     unitCode?: string;
   };
+  purchasedPages?: number[];
+  totalPages?: number;
 }
 
 export const activeViewingSessions = new Map<string, ViewingSessionData>();
 
-export function checkOrCreateViewingSession(orderId: string, deviceId: string, now: number = Date.now()): { 
+export function checkOrCreateViewingSession(
+  orderId: string, 
+  deviceId: string, 
+  now: number = Date.now(),
+  purchasedPages?: number[],
+  totalPages?: number
+): { 
   valid: boolean; 
   remainingSeconds: number;
   session?: ViewingSessionData | null;
@@ -4392,6 +4427,10 @@ export function checkOrCreateViewingSession(orderId: string, deviceId: string, n
     if (!existing.visitedBlocks) {
       existing.visitedBlocks = {};
     }
+    if (purchasedPages && Array.isArray(purchasedPages) && purchasedPages.length > 0 && !existing.purchasedPages) {
+      existing.purchasedPages = purchasedPages;
+      if (totalPages) existing.totalPages = totalPages;
+    }
     // Update block eligibility status if block timer has completed
     const curBlockTimer = existing.blockTimers[existing.activeBlock];
     if (curBlockTimer && !curBlockTimer.isEligibleForNext && now >= curBlockTimer.eligibilityExpiresAt) {
@@ -4400,20 +4439,24 @@ export function checkOrCreateViewingSession(orderId: string, deviceId: string, n
     const curRemaining = curBlockTimer ? Math.max(0, Math.ceil((curBlockTimer.eligibilityExpiresAt - now) / 1000)) : 0;
     return { valid: true, remainingSeconds: curRemaining, session: existing };
   } else {
+    const initialPage = (purchasedPages && purchasedPages.length > 0) ? purchasedPages[0] : 1;
+    const initialBlock = getBlockIndexForPage(initialPage);
     const newSession: ViewingSessionData = {
       orderId,
       deviceId,
-      currentPage: 1,
-      activeBlock: 1,
+      currentPage: initialPage,
+      activeBlock: initialBlock,
       blockTimers: {
-        1: {
-          blockIndex: 1,
+        [initialBlock]: {
+          blockIndex: initialBlock,
           startedAt: now,
           eligibilityExpiresAt: now + BLOCK_PROGRESSION_DURATION_MS,
           isEligibleForNext: false
         }
       },
-      visitedBlocks: {}
+      visitedBlocks: {},
+      purchasedPages,
+      totalPages
     };
     activeViewingSessions.set(sessionKey, newSession);
     return { valid: true, remainingSeconds: BLOCK_PROGRESSION_DURATION_SECONDS, session: newSession };
@@ -4449,8 +4492,30 @@ export function requestSessionNavigation(
     return { success: false, error: 'invalid_page', message: 'Invalid page requested.' };
   }
 
+  // Strict page entitlement check: If purchasedPages is defined, targetPage MUST be in purchasedPages
+  if (session.purchasedPages && session.purchasedPages.length > 0) {
+    if (!session.purchasedPages.includes(targetPage)) {
+      return {
+        success: false,
+        error: 'page_not_purchased',
+        message: `Page ${targetPage} is not part of your purchased pages entitlement.`,
+        activeBlock: session.activeBlock
+      };
+    }
+  }
+
   const targetBlock = getBlockIndexForPage(targetPage);
   const currentActiveBlock = session.activeBlock;
+
+  // Determine allowed purchased blocks sequence if purchasedPages is defined
+  let nextAllowedBlock = currentActiveBlock + 1;
+  if (session.purchasedPages && session.purchasedPages.length > 0) {
+    const purchasedBlocks = Array.from(new Set(session.purchasedPages.map(p => getBlockIndexForPage(p)))).sort((a, b) => a - b);
+    const curIdx = purchasedBlocks.indexOf(currentActiveBlock);
+    if (curIdx >= 0) {
+      nextAllowedBlock = (curIdx + 1 < purchasedBlocks.length) ? purchasedBlocks[curIdx + 1] : -1;
+    }
+  }
 
   // 1. Moving between pages within the current ACTIVE block is always permitted without restarting timer
   if (targetBlock === currentActiveBlock) {
@@ -4501,19 +4566,19 @@ export function requestSessionNavigation(
     };
   }
 
-  // 3. Attempting to jump ahead beyond the immediate next block (e.g. Block 1 -> Block 3)
-  if (targetBlock > currentActiveBlock + 1) {
+  // 3. Attempting to jump ahead beyond the immediate next block
+  if (nextAllowedBlock === -1 || targetBlock !== nextAllowedBlock) {
     return {
       success: false,
       error: 'block_jump_prohibited',
-      message: `Direct jumping beyond the immediate next block is prohibited. You must progress sequentially.`,
+      message: `Direct jumping beyond the immediate next purchased block is prohibited. You must progress sequentially.`,
       activeBlock: currentActiveBlock,
       targetBlock
     };
   }
 
-  // 4. Attempting to enter the immediate next block (e.g. Block 1 -> Block 2)
-  if (targetBlock === currentActiveBlock + 1) {
+  // 4. Attempting to enter the immediate next eligible block
+  if (targetBlock === nextAllowedBlock) {
     const curTimer = session.blockTimers[currentActiveBlock];
     const isEligible = Boolean(curTimer && (curTimer.isEligibleForNext || now >= curTimer.eligibilityExpiresAt));
 
@@ -4661,6 +4726,13 @@ export function authorizeDirectPageAccess(
   targetPage: number,
   now: number = Date.now()
 ): { allowed: boolean; reason?: string } {
+  // Strict page entitlement check: If purchasedPages is defined, targetPage MUST be in purchasedPages
+  if (session.purchasedPages && session.purchasedPages.length > 0) {
+    if (!session.purchasedPages.includes(targetPage)) {
+      return { allowed: false, reason: 'page_not_purchased' };
+    }
+  }
+
   const targetBlock = getBlockIndexForPage(targetPage);
   const activeBlock = session.activeBlock;
 
@@ -4679,7 +4751,16 @@ export function authorizeDirectPageAccess(
   }
 
   // 3. Pages belonging to next block: check eligibility
-  if (targetBlock === activeBlock + 1) {
+  let nextAllowedBlock = activeBlock + 1;
+  if (session.purchasedPages && session.purchasedPages.length > 0) {
+    const purchasedBlocks = Array.from(new Set(session.purchasedPages.map(p => getBlockIndexForPage(p)))).sort((a, b) => a - b);
+    const curIdx = purchasedBlocks.indexOf(activeBlock);
+    if (curIdx >= 0) {
+      nextAllowedBlock = (curIdx + 1 < purchasedBlocks.length) ? purchasedBlocks[curIdx + 1] : -1;
+    }
+  }
+
+  if (targetBlock === nextAllowedBlock) {
     const curTimer = session.blockTimers[activeBlock];
     const isEligible = Boolean(curTimer && (curTimer.isEligibleForNext || now >= curTimer.eligibilityExpiresAt));
     if (!isEligible) {
@@ -4707,7 +4788,54 @@ app.get("/api/document/session/:token", async (req, res) => {
     const deviceId = match ? match[1] : null;
     if (!deviceId) return res.status(403).json({ error: "Device unauthorized" });
 
-    const sessionCheck = checkOrCreateViewingSession(orderId, deviceId);
+    // Fetch order & paper metadata for authoritative purchased_pages and total_pages
+    let purchasedPages: number[] | null = null;
+    let totalPages: number = 0;
+    let customerFirstName = '';
+    let paperTitle = 'Protected Document';
+    let unitCode = '';
+
+    try {
+        const { data: order } = await supabaseAdmin
+            .from('Orders')
+            .select('id, paper_id, status, purchased_pages, page_quantity, customers(first_name)')
+            .eq('id', orderId)
+            .maybeSingle();
+        if (order) {
+            if (order.purchased_pages) {
+                let raw = order.purchased_pages;
+                if (typeof raw === 'string') {
+                    try { raw = JSON.parse(raw); } catch {}
+                }
+                if (Array.isArray(raw)) {
+                    purchasedPages = raw.map(p => Number(p)).filter(p => Number.isInteger(p) && p >= 1);
+                }
+            }
+            if (order.paper_id) {
+                const { data: paper } = await supabaseAdmin
+                    .from('Papers')
+                    .select('paper_title, unit_code, total_pages')
+                    .eq('id', order.paper_id)
+                    .maybeSingle();
+                if (paper) {
+                    paperTitle = paper.paper_title || paperTitle;
+                    unitCode = paper.unit_code || '';
+                    totalPages = Number(paper.total_pages) || 0;
+                }
+            }
+            const cust = Array.isArray(order.customers) ? order.customers[0] : order.customers;
+            customerFirstName = cust?.first_name || '';
+
+            // Default whole document purchase if purchased_pages is not specified
+            if ((!purchasedPages || purchasedPages.length === 0) && totalPages > 0) {
+                purchasedPages = Array.from({ length: totalPages }, (_, i) => i + 1);
+            }
+        }
+    } catch (err) {
+        console.error('[SESSION METADATA ERROR]', err);
+    }
+
+    const sessionCheck = checkOrCreateViewingSession(orderId, deviceId, Date.now(), purchasedPages || undefined, totalPages || undefined);
     if (!sessionCheck.valid || !sessionCheck.session) {
         return res.status(403).json({ error: "Viewing session expired." });
     }
@@ -4723,37 +4851,14 @@ app.get("/api/document/session/:token", async (req, res) => {
         ? (curBlockTimer.isEligibleForNext || now >= curBlockTimer.eligibilityExpiresAt) 
         : false;
 
-    const blockRange = getBlockPageRange(curBlock);
+    const blockRange = getBlockPageRange(curBlock, session.totalPages || totalPages);
 
-    if (!session.customerInfo) {
-        try {
-            const { data: order } = await supabaseAdmin
-                .from('Orders')
-                .select('id, paper_id, customers(first_name)')
-                .eq('id', orderId)
-                .maybeSingle();
-            if (order) {
-                let paperTitle = 'Protected Document';
-                let unitCode = '';
-                if (order.paper_id) {
-                    const { data: paper } = await supabaseAdmin
-                        .from('Papers')
-                        .select('paper_title, unit_code')
-                        .eq('id', order.paper_id)
-                        .maybeSingle();
-                    if (paper) {
-                        paperTitle = paper.paper_title || paperTitle;
-                        unitCode = paper.unit_code || '';
-                    }
-                }
-                const cust = Array.isArray(order.customers) ? order.customers[0] : order.customers;
-                session.customerInfo = {
-                    firstName: cust?.first_name || '',
-                    paperTitle,
-                    unitCode
-                };
-            }
-        } catch {}
+    if (!session.customerInfo && customerFirstName) {
+        session.customerInfo = {
+            firstName: customerFirstName,
+            paperTitle,
+            unitCode
+        };
     }
 
     return res.json({ 
@@ -4772,7 +4877,9 @@ app.get("/api/document/session/:token", async (req, res) => {
             isEligibleForNext
         },
         visitedBlocks: session.visitedBlocks || {},
-        customerInfo: session.customerInfo || null
+        customerInfo: session.customerInfo || null,
+        purchasedPages: session.purchasedPages || purchasedPages || null,
+        totalPages: session.totalPages || totalPages || null
     });
 });
 
@@ -4884,6 +4991,9 @@ app.get("/api/document/page/:token/:pageNum", async (req, res) => {
     const authCheck = authorizeDirectPageAccess(sessionCheck.session, targetPage);
     if (!authCheck.allowed) {
         console.warn(`[DIRECT PAGE BLOCKED] Order ${orderId}, Device ${deviceId}, Page ${targetPage}: ${authCheck.reason}`);
+        if (authCheck.reason === 'page_not_purchased') {
+            return res.status(403).send("Page access blocked: Page not purchased.");
+        }
         if (authCheck.reason === 'session_expired') {
             return res.status(403).send("Viewing session expired.");
         }
@@ -4895,6 +5005,9 @@ app.get("/api/document/page/:token/:pageNum", async (req, res) => {
         }
         if (authCheck.reason === 'transition_gate_required') {
             return res.status(403).send("Page access blocked: 1-minute navigation gate required for previously visited page.");
+        }
+        if (authCheck.reason === 'previous_block_locked') {
+            return res.status(403).send("Page access blocked: Previous block is locked.");
         }
         return res.status(403).send("Page access blocked: Navigation request required.");
     }
@@ -4920,17 +5033,26 @@ app.get("/api/document/page/:token/:pageNum", async (req, res) => {
     }
 
     try {
-        const { restrictedPdfBytes, pageCount } = await getAuthoritativeRestrictedPdf({
+        const { restrictedPdfBytes, pageCount, authorizedPages } = await getAuthoritativeRestrictedPdf({
             orderId,
             order,
             paper,
         });
 
-        if (targetPage > pageCount) {
-            return res.status(404).send(`Page ${targetPage} out of bounds for document with ${pageCount} pages.`);
+        let pageIndexInRestricted = targetPage;
+        if (authorizedPages && authorizedPages.length > 0) {
+            const idx = authorizedPages.indexOf(targetPage);
+            if (idx === -1) {
+                return res.status(403).send("Page access blocked: Page not purchased.");
+            }
+            pageIndexInRestricted = idx + 1;
         }
 
-        const singlePageBytes = await generatePageSpecificPDF(restrictedPdfBytes, [targetPage]);
+        if (pageIndexInRestricted > pageCount) {
+            return res.status(404).send(`Page out of bounds for document with ${pageCount} pages.`);
+        }
+
+        const singlePageBytes = await generatePageSpecificPDF(restrictedPdfBytes, [pageIndexInRestricted]);
 
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="page_${targetPage}.pdf"`);
