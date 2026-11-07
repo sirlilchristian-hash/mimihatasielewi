@@ -32,6 +32,7 @@ export interface PricingCalculationResult {
 export function calculateAuthoritativePagesPrice(
   paper: {
     price?: number | string;
+    total_pages?: number | string;
     eligible_pages?: number[] | null;
     pricing_model?: PagePricingModel | string;
     fixed_page_price?: number;
@@ -39,10 +40,12 @@ export function calculateAuthoritativePagesPrice(
     custom_page_prices?: Record<string | number, number>;
   },
   selectedPages: number[],
-  minPagesRequired: number = 6
+  minPagesRequired: number = 4
 ): PricingCalculationResult {
   const rawEligible = Array.isArray(paper.eligible_pages) ? paper.eligible_pages : [];
-  const eligible = rawEligible.length >= minPagesRequired ? rawEligible : Array.from({ length: 12 }, (_, i) => i + 1);
+  const maxSelected = selectedPages.length > 0 ? Math.max(...selectedPages.map(p => Number(p)).filter(p => !isNaN(p))) : 0;
+  const docTotalPages = Math.max(minPagesRequired, Number(paper.total_pages) || maxSelected || 12);
+  const eligible = rawEligible.length >= minPagesRequired ? rawEligible : Array.from({ length: docTotalPages }, (_, i) => i + 1);
   const normalizedPages = Array.from(new Set(selectedPages.map((p) => Number(p))))
     .filter((p) => !isNaN(p) && p > 0)
     .sort((a, b) => a - b);
@@ -70,7 +73,7 @@ export function calculateAuthoritativePagesPrice(
       unitPriceSummary: `Minimum ${minPagesRequired} pages`,
       itemizedDetails: [],
       isValid: false,
-      validationError: `Please select at least ${minPagesRequired} pages to proceed with page-based purchase.`,
+      validationError: `Minimum order requirement is ${minPagesRequired} pages (blocks). Please select at least ${minPagesRequired} pages to proceed.`,
     };
   }
 

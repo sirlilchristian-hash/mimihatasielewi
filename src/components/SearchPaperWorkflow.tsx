@@ -237,14 +237,22 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
   const [hasDownloaded, setHasDownloaded] = useState<boolean>(false);
   const [isProcessingWhatsApp, setIsProcessingWhatsApp] = useState<boolean>(false);
   const [purchaseType, setPurchaseType] = useState<'full' | 'pages'>('full');
-  const [pageQuantity, setPageQuantity] = useState<number>(6);
+  const [pageQuantity, setPageQuantity] = useState<number>(4);
+  const [selectedBlockIndex, setSelectedBlockIndex] = useState<number>(1);
   const [isDetailsExpanded, setIsDetailsExpanded] = useState<boolean>(false);
 
   const totalPagesForSelected = selectedPaper ? (Number(selectedPaper.total_pages) || 12) : 12;
-  const lastNPages = Array.from({ length: pageQuantity }, (_, i) => totalPagesForSelected - pageQuantity + i + 1);
+  const totalBlocksForSelected = Math.max(1, Math.ceil(totalPagesForSelected / 4));
+  const safeBlockIndex = Math.min(Math.max(1, selectedBlockIndex), totalBlocksForSelected);
+  const startPageForBlock = (safeBlockIndex - 1) * 4 + 1;
+  const endPageForBlock = Math.min(startPageForBlock + pageQuantity - 1, totalPagesForSelected);
+  const selectedPageSpan = Array.from(
+    { length: Math.max(0, endPageForBlock - startPageForBlock + 1) },
+    (_, i) => startPageForBlock + i
+  );
 
   const pagesPricing = selectedPaper
-    ? calculateAuthoritativePagesPrice(selectedPaper, lastNPages)
+    ? calculateAuthoritativePagesPrice(selectedPaper, selectedPageSpan)
     : { totalAmount: 0, breakdown: '', pricingModel: 'fixed' as const, unitPriceSummary: '', itemizedDetails: [], isValid: false };
 
   const isSelectedPaperFree = Boolean(
@@ -611,6 +619,13 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
           purchase_type: purchaseType,
           ...(purchaseType === 'pages' ? {
             page_quantity: pageQuantity,
+            selected_pages: selectedPageSpan,
+            selected_blocks: Array.from(
+              { length: Math.ceil(pageQuantity / 4) },
+              (_, i) => safeBlockIndex + i
+            ),
+            selected_block: safeBlockIndex,
+            start_block: safeBlockIndex,
           } : {}),
         }),
       });
@@ -1246,33 +1261,100 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
                             <div className="flex-1 space-y-2">
                               <div className="flex items-center justify-between flex-wrap gap-2">
                                 <span className="font-black text-slate-900 text-sm">
-                                  Option B — Buy Selected Pages (Last N Pages)
+                                  Option B — Buy Selected Page Block(s)
                                 </span>
                                 <span className="text-xs font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-300">
-                                  {totalPages} pages total
+                                  {totalPages} pages ({totalBlocksForSelected} blocks)
                                 </span>
                               </div>
 
                               <p className="text-xs text-slate-600 leading-relaxed">
-                                Purchase the last <strong className="font-extrabold text-slate-900">{pageQuantity}</strong> pages of the document (pages <strong className="font-mono font-bold text-slate-900">{Math.max(1, totalPages - pageQuantity + 1)}–{totalPages}</strong>). Automatically selected from the end of the document.
+                                Select specific 4-page block(s) to purchase. Each block contains 4 pages (e.g. Block 1 = Pages 1–4, Block 2 = Pages 5–8).
                               </p>
 
                               {purchaseType === 'pages' && (
                                 <div className="pt-3 mt-2 border-t border-emerald-200/80 space-y-4">
-                                  <div className="flex items-center gap-3">
-                                    <label className="font-bold text-slate-700 text-xs whitespace-nowrap">Number of pages to order:</label>
-                                    <input
-                                      type="number"
-                                      min="1"
-                                      max={totalPages}
-                                      value={pageQuantity}
-                                      onClick={(e) => e.stopPropagation()}
-                                      onChange={(e) => {
-                                        const val = parseInt(e.target.value, 10);
-                                        if (!isNaN(val)) setPageQuantity(Math.max(1, Math.min(totalPages, val)));
-                                      }}
-                                      className="w-24 px-3 py-1.5 rounded-lg border border-slate-300 font-bold text-sm bg-white"
-                                    />
+                                  <div className="space-y-1.5">
+                                    <label className="font-bold text-slate-700 text-xs block">Select Block to Purchase (4 Pages per Block):</label>
+                                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                                      {Array.from({ length: totalBlocksForSelected }, (_, i) => i + 1).map((b) => {
+                                        const start = (b - 1) * 4 + 1;
+                                        const end = Math.min(b * 4, totalPages);
+                                        const isSelected = safeBlockIndex === b && pageQuantity === (end - start + 1);
+                                        return (
+                                          <button
+                                            key={b}
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setSelectedBlockIndex(b);
+                                              setPageQuantity(Math.min(4, end - start + 1));
+                                            }}
+                                            className={`px-3 py-2 rounded-xl text-left border transition-all text-xs font-semibold cursor-pointer ${
+                                              isSelected
+                                                ? 'border-emerald-600 bg-emerald-600 text-white shadow-xs'
+                                                : 'border-slate-200 bg-white hover:border-emerald-300 text-slate-800'
+                                            }`}
+                                          >
+                                            <div className="font-black text-xs">Block {b}</div>
+                                            <div className={`text-[11px] ${isSelected ? 'text-emerald-100' : 'text-slate-500'}`}>
+                                              Pages {start}–{end} ({end - start + 1}p)
+                                            </div>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                                    <div className="space-y-1">
+                                      <label className="font-bold text-slate-700 text-xs block">Starting Block:</label>
+                                      <select
+                                        value={safeBlockIndex}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onChange={(e) => {
+                                          const b = parseInt(e.target.value, 10);
+                                          if (!isNaN(b)) setSelectedBlockIndex(b);
+                                        }}
+                                        className="w-full px-3 py-1.5 rounded-lg border border-slate-300 font-bold text-xs bg-white text-slate-800"
+                                      >
+                                        {Array.from({ length: totalBlocksForSelected }, (_, i) => i + 1).map((b) => {
+                                          const start = (b - 1) * 4 + 1;
+                                          const end = Math.min(b * 4, totalPages);
+                                          return (
+                                            <option key={b} value={b}>
+                                              Block {b} (Pages {start}–{end})
+                                            </option>
+                                          );
+                                        })}
+                                      </select>
+                                    </div>
+                                    <div className="space-y-1">
+                                      <label className="font-bold text-slate-700 text-xs block">Number of Pages (min 4):</label>
+                                      <input
+                                        type="number"
+                                        min="4"
+                                        max={totalPages}
+                                        value={pageQuantity}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onChange={(e) => {
+                                          const val = parseInt(e.target.value, 10);
+                                          if (!isNaN(val)) setPageQuantity(Math.max(4, Math.min(totalPages, val)));
+                                        }}
+                                        className="w-full px-3 py-1.5 rounded-lg border border-slate-300 font-bold text-xs bg-white text-slate-800"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div className="p-2.5 bg-emerald-100/70 border border-emerald-300 rounded-xl text-xs space-y-1">
+                                    <div className="flex justify-between font-bold text-emerald-950">
+                                      <span>Selected Block & Page Span:</span>
+                                      <span className="font-mono">Block {safeBlockIndex} (Pages {startPageForBlock}–{endPageForBlock})</span>
+                                    </div>
+                                    <div className="flex justify-between text-slate-600 text-[11px]">
+                                      <span>Entitlement Coverage:</span>
+                                      <span>{pageQuantity} Pages ({Math.ceil(pageQuantity / 4)} Block{Math.ceil(pageQuantity / 4) > 1 ? 's' : ''})</span>
+                                    </div>
                                   </div>
                                   <div className="flex items-center justify-between text-emerald-950 font-black text-sm pt-2 border-t border-emerald-200">
                                     <span>Authoritative Amount:</span>
@@ -1353,12 +1435,12 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
                 <div className="p-3.5 rounded-xl bg-emerald-50/70 border border-emerald-200 text-xs space-y-1.5">
                   <div className="flex items-center justify-between text-slate-700">
                     <span className="font-semibold">Selected Page Count:</span>
-                    <span className="font-black text-emerald-950">{pageQuantity} Pages (Last N Pages)</span>
+                    <span className="font-black text-emerald-950">Block {safeBlockIndex} — {pageQuantity} Pages (Pages {startPageForBlock}–{endPageForBlock})</span>
                   </div>
                   <div className="flex items-start justify-between gap-2 text-slate-700">
                     <span className="font-semibold shrink-0">Purchased Page Span:</span>
                     <span className="font-mono font-bold text-emerald-900 text-right break-all">
-                      [{lastNPages.join(', ')}]
+                      [{selectedPageSpan.join(', ')}]
                     </span>
                   </div>
                   <div className="flex items-center justify-between text-slate-600 pt-1 border-t border-emerald-200/80">

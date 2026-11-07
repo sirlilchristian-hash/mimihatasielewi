@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { UserCog, Shield, Key, Power, Plus, Loader2, AlertCircle } from 'lucide-react';
+import { UserCog, Shield, Key, Power, Plus, Loader2, AlertCircle, Trash2, Search } from 'lucide-react';
 import { AdminUserRecord } from './adminTypes';
 
 interface AdminUsersViewProps {
@@ -12,6 +12,7 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
   currentAdminRole,
 }) => {
   const [users, setUsers] = useState<AdminUserRecord[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -24,6 +25,30 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
   const [roleUser, setRoleUser] = useState<AdminUserRecord | null>(null);
   const [selectedRole, setSelectedRole] = useState('');
   const [isUpdatingRole, setIsUpdatingRole] = useState(false);
+
+  const handleDeleteUser = async (user: AdminUserRecord) => {
+    if (!confirm(`SECURITY CONFIRMATION: Are you sure you want to permanently delete administrator account "${user.account_id}"?`)) {
+      return;
+    }
+
+    try {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(user.account_id)}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('admin_token')}`,
+        },
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        alert(data.message || `Administrator "${user.account_id}" removed.`);
+        fetchUsers();
+      } else {
+        alert(data.error || 'Failed to delete administrator account.');
+      }
+    } catch (err) {
+      alert('Network error while deleting user.');
+    }
+  };
 
   const fetchUsers = async () => {
     try {
@@ -162,6 +187,18 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
         </div>
       )}
 
+      {/* Search Input Bar */}
+      <div className="relative">
+        <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="Search administrators by Account ID, Role, or Status..."
+          className="w-full pl-9 pr-4 py-2 bg-slate-900/90 border border-slate-800 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-[#00D26A]"
+        />
+      </div>
+
       {/* Users Table */}
       <div className="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden">
         {loading ? (
@@ -169,9 +206,9 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
             <Loader2 className="w-8 h-8 text-[#00D26A] animate-spin mx-auto" />
             <div className="text-xs text-slate-400">Loading administrator accounts...</div>
           </div>
-        ) : users.length === 0 ? (
+        ) : users.filter(u => !searchQuery || u.account_id.toLowerCase().includes(searchQuery.toLowerCase()) || u.role.toLowerCase().includes(searchQuery.toLowerCase()) || u.status.toLowerCase().includes(searchQuery.toLowerCase())).length === 0 ? (
           <div className="py-16 text-center text-xs text-slate-500">
-            No administrator records found.
+            No administrator records matching "{searchQuery}".
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -186,7 +223,9 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
-                {users.map((u) => {
+                {users
+                  .filter(u => !searchQuery || u.account_id.toLowerCase().includes(searchQuery.toLowerCase()) || u.role.toLowerCase().includes(searchQuery.toLowerCase()) || u.status.toLowerCase().includes(searchQuery.toLowerCase()))
+                  .map((u) => {
                   const isSuperAdmin = u.account_id === 'superadmin' || u.role === 'super_admin';
                   const isActive = u.status === 'active';
 
@@ -262,12 +301,22 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
                               onClick={() => handleToggleStatus(u)}
                               className={`p-1.5 rounded-lg text-xs font-semibold transition-colors ${
                                 isActive
-                                  ? 'text-slate-400 hover:text-rose-400 hover:bg-rose-500/10'
+                                  ? 'text-slate-400 hover:text-amber-400 hover:bg-amber-500/10'
                                   : 'text-emerald-400 hover:bg-emerald-500/10'
                               }`}
-                              title={isActive ? 'Disable Account' : 'Activate Account'}
+                              title={isActive ? 'Suspend Account' : 'Activate Account'}
                             >
                               <Power className="w-3.5 h-3.5" />
+                            </button>
+
+                            {/* Delete Administrator */}
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteUser(u)}
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+                              title="Delete Account"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
                             </button>
                           </div>
                         ) : (

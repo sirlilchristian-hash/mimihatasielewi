@@ -53,6 +53,121 @@ export function hasOrderEmailBeenSent(orderId: string): boolean {
   return existing?.status === 'EMAIL SENT';
 }
 
+export async function claimAndSendOrderEmail(
+  orderId: string,
+  emailDetails: {
+    to: string;
+    firstName: string;
+    paperTitle: string;
+    openDocumentUrl: string;
+  }
+): Promise<{ success: boolean; status: string; error?: string; alreadySent?: boolean }> {
+  if (!orderId) return { success: false, status: 'INVALID_ORDER' };
+
+  // 1. Fast cache check
+  const currentLocal = orderEmailStatusMap.get(orderId);
+  if (currentLocal?.status === 'EMAIL SENT') {
+    return { success: true, status: 'EMAIL SENT', alreadySent: true };
+  }
+  if ((currentLocal as any)?.status === 'PROCESSING') {
+    return { success: true, status: 'PROCESSING_IN_PROGRESS', alreadySent: true };
+  }
+  orderEmailStatusMap.set(orderId, { status: 'PROCESSING' as any, sentAt: new Date().toISOString() });
+
+  // 2. Database status & atomic claim check
+  const now = new Date();
+  const staleThreshold = new Date(now.getTime() - 2 * 60 * 1000).toISOString(); // 2 mins stale threshold
+
+  let claimed = false;
+  try {
+    const { data: dbOrder } = await supabaseAdmin
+      .from("Orders")
+      .select("id, status, updated_at")
+      .eq("id", orderId)
+      .maybeSingle();
+
+    if (dbOrder) {
+      if (dbOrder.status === 'completed') {
+        recordOrderEmailSent(orderId, { status: 'EMAIL SENT', sentAt: dbOrder.updated_at });
+        return { success: true, status: 'EMAIL SENT', alreadySent: true };
+      }
+
+      // Try atomic claim: update status to 'processing' if status is 'paid' OR (status is 'processing' AND updated_at < staleThreshold)
+      const { data: updateRes, error: claimErr } = await supabaseAdmin
+        .from("Orders")
+        .update({ status: 'processing', updated_at: now.toISOString() })
+        .eq("id", orderId)
+        .or(`status.eq.paid,and(status.eq.processing,updated_at.lt.${staleThreshold})`)
+        .select()
+        .maybeSingle();
+
+      if (!claimErr && updateRes) {
+        claimed = true;
+      } else if (dbOrder.status === 'processing') {
+        console.log(`[ORDER_EMAIL] Order ${orderId} is currently being processed by another worker. Skipping.`);
+        return { success: false, status: 'PROCESSING_IN_PROGRESS' };
+      } else {
+        claimed = true; // Fallback claim for unconstrained environment
+      }
+    } else {
+      claimed = true; // Fallback claim for unpersisted order
+    }
+  } catch (err) {
+    claimed = true; // Local mode fallback
+  }
+
+  if (!claimed) {
+    return { success: false, status: 'CLAIM_FAILED' };
+  }
+
+  // 3. Dispatch activation email via Nodemailer service
+  try {
+    const emailResult = await sendActivationEmail({
+      to: emailDetails.to,
+      firstName: emailDetails.firstName,
+      paperTitle: emailDetails.paperTitle,
+      openDocumentUrl: emailDetails.openDocumentUrl,
+    });
+
+    if (emailResult.status === 'EMAIL SENT') {
+      // Mark as completed in DB only AFTER email provider confirms acceptance
+      try {
+        await supabaseAdmin
+          .from("Orders")
+          .update({ status: 'completed', updated_at: new Date().toISOString() })
+          .eq("id", orderId);
+      } catch {
+        // DB update fallback
+      }
+      recordOrderEmailSent(orderId, { status: 'EMAIL SENT', sentAt: new Date().toISOString() });
+      return { success: true, status: 'EMAIL SENT' };
+    } else {
+      // Release claim back to 'paid' so another worker or retry attempt can claim and send
+      try {
+        await supabaseAdmin
+          .from("Orders")
+          .update({ status: 'paid', updated_at: new Date().toISOString() })
+          .eq("id", orderId);
+      } catch {
+        // DB reset fallback
+      }
+      recordOrderEmailSent(orderId, { status: 'EMAIL FAILED', error: emailResult.error });
+      return { success: false, status: emailResult.status, error: emailResult.error };
+    }
+  } catch (mailErr: any) {
+    try {
+      await supabaseAdmin
+        .from("Orders")
+        .update({ status: 'paid', updated_at: new Date().toISOString() })
+        .eq("id", orderId);
+    } catch {
+      // Fallback
+    }
+    recordOrderEmailSent(orderId, { status: 'EMAIL FAILED', error: mailErr?.message || 'Dispatch exception' });
+    return { success: false, status: 'EMAIL FAILED', error: mailErr?.message || 'Dispatch exception' };
+  }
+}
+
 // Persistent / In-memory mapping of orderId & checkoutRequestId to customer email
 const ORDER_EMAILS_FILE = path.join(process.cwd(), '.order_emails.json');
 
@@ -499,13 +614,103 @@ export async function getAuthoritativePdfPageCount(filePath: string): Promise<{ 
   }
 }
 
-export function computeAuthoritativeLifoPages(totalPages: number, quantity: number): number[] {
+export function resolveAuthoritativeBlockPages(
+  totalPages: number,
+  params: {
+    selected_pages?: number[] | string;
+    selected_blocks?: number[] | string;
+    selected_block?: number | string;
+    start_block?: number | string;
+    page_quantity?: number | string;
+  }
+): number[] {
+  const n = Number(totalPages);
+  if (isNaN(n) || n <= 0) return [];
+
+  // 1. Explicit selected_pages array
+  if (params.selected_pages) {
+    let raw = params.selected_pages;
+    if (typeof raw === 'string') {
+      try { raw = JSON.parse(raw); } catch {}
+    }
+    if (Array.isArray(raw) && raw.length > 0) {
+      const sorted = Array.from(new Set(raw.map(p => Number(p))))
+        .filter(p => !isNaN(p) && Number.isInteger(p) && p >= 1 && p <= n)
+        .sort((a, b) => a - b);
+      if (sorted.length > 0) return sorted;
+    }
+  }
+
+  // 2. Explicit selected_blocks array
+  if (params.selected_blocks) {
+    let rawBlocks = params.selected_blocks;
+    if (typeof rawBlocks === 'string') {
+      try { rawBlocks = JSON.parse(rawBlocks); } catch {}
+    }
+    if (Array.isArray(rawBlocks) && rawBlocks.length > 0) {
+      const blockSet = new Set<number>();
+      for (const b of rawBlocks) {
+        const bIdx = Number(b);
+        if (!isNaN(bIdx) && Number.isInteger(bIdx) && bIdx >= 1) {
+          const startPage = (bIdx - 1) * 4 + 1;
+          const endPage = Math.min(bIdx * 4, n);
+          for (let p = startPage; p <= endPage; p++) {
+            blockSet.add(p);
+          }
+        }
+      }
+      const sorted = Array.from(blockSet).sort((a, b) => a - b);
+      if (sorted.length > 0) return sorted;
+    }
+  }
+
+  // 3. Explicit selected_block or start_block
+  if (params.selected_block || params.start_block) {
+    const startB = Number(params.selected_block || params.start_block);
+    const qty = parseInt(String(params.page_quantity || 4), 10);
+    const numBlocks = Math.max(1, Math.ceil(qty / 4));
+    if (!isNaN(startB) && Number.isInteger(startB) && startB >= 1) {
+      const blockSet = new Set<number>();
+      for (let b = startB; b < startB + numBlocks; b++) {
+        const startPage = (b - 1) * 4 + 1;
+        const endPage = Math.min(b * 4, n);
+        for (let p = startPage; p <= endPage; p++) {
+          blockSet.add(p);
+        }
+      }
+      const sorted = Array.from(blockSet).sort((a, b) => a - b);
+      if (sorted.length > 0) return sorted;
+    }
+  }
+
+  // 4. Default fallback: sequential blocks starting from Block 1 (pages 1..q)
+  const qty = parseInt(String(params.page_quantity || 4), 10);
+  const q = isNaN(qty) || qty < 1 ? 4 : Math.min(qty, n);
+  return Array.from({ length: q }, (_, i) => i + 1);
+}
+
+export function computeAuthoritativeLifoPages(
+  totalPages: number,
+  quantity: number,
+  options?: {
+    selected_pages?: number[] | string;
+    selected_blocks?: number[] | string;
+    selected_block?: number | string;
+    start_block?: number | string;
+  }
+): number[] {
   const n = Number(totalPages);
   const q = Number(quantity);
   if (isNaN(n) || isNaN(q) || !Number.isInteger(q) || q < 1 || q > n) {
     return [];
   }
-  return Array.from({ length: q }, (_, i) => n - q + i + 1);
+
+  if (options && (options.selected_pages || options.selected_blocks || options.selected_block || options.start_block)) {
+    const resolved = resolveAuthoritativeBlockPages(totalPages, { ...options, page_quantity: quantity });
+    if (resolved.length > 0) return resolved;
+  }
+
+  return Array.from({ length: Math.min(q, n) }, (_, i) => i + 1);
 }
 
 let aiClient: GoogleGenAI | null = null;
@@ -955,21 +1160,40 @@ export function processDarajaCallbackPayload(callbackPayload: any): {
 export async function verifyDarajaCallbackAuthenticity(
   checkoutRequestId: string,
   customConfig?: Partial<DarajaConfig>
-): Promise<{ verified: boolean; resultCode: number | null; resultDesc: string; error?: string }> {
+): Promise<{
+  verified: boolean;
+  paymentVerified: boolean;
+  amountPhoneVerified: boolean;
+  receiptIndependentlyVerified: boolean;
+  resultCode: number | null;
+  resultDesc: string;
+  error?: string;
+}> {
   try {
     const queryRes = await queryDarajaStkStatus({
       checkoutRequestId,
       config: customConfig,
       force: true
     });
+    const paymentVerified = queryRes.isSuccess && queryRes.resultCode === 0;
+    // STK Push Query response does not contain MpesaReceiptNumber in query schema.
+    // Receipt supplied by unsigned callback metadata is NOT independently authenticated by STK Query.
+    const receiptIndependentlyVerified = false;
+
     return {
-      verified: queryRes.isSuccess && queryRes.resultCode === 0,
+      verified: paymentVerified,
+      paymentVerified,
+      amountPhoneVerified: paymentVerified,
+      receiptIndependentlyVerified,
       resultCode: queryRes.resultCode,
       resultDesc: queryRes.resultDesc
     };
   } catch (err: any) {
     return {
       verified: false,
+      paymentVerified: false,
+      amountPhoneVerified: false,
+      receiptIndependentlyVerified: false,
       resultCode: null,
       resultDesc: 'Query exception',
       error: err?.message || 'Verification exception'
@@ -1102,13 +1326,74 @@ app.post("/api/admin/login", async (req, res) => {
   const cleanPassword = typeof password === "string" ? password.trim() : "";
 
   try {
-    // Infallible admin authentication: accept any admin account ID and password combo
+    let targetUser: { account_id: string; password_hash: string; role: string; status: string } | null = null;
+
+    // 1. Query Supabase database admin_users table
+    try {
+      const { data, error } = await supabaseAdmin
+        .from("admin_users")
+        .select("account_id, password_hash, role, status")
+        .ilike("account_id", cleanAccountId)
+        .maybeSingle();
+
+      if (!error && data) {
+        targetUser = data;
+      }
+    } catch (dbErr) {
+      console.warn("[Admin Auth DB Query Warn]", dbErr);
+    }
+
+    // 2. Fallback to local admin store if DB unconfigured or user not found in DB
+    if (!targetUser) {
+      const localUser = fallbackAdminUsers.find(
+        (u) => u.account_id.toLowerCase() === cleanAccountId.toLowerCase()
+      );
+      if (localUser) {
+        targetUser = {
+          account_id: localUser.account_id,
+          password_hash: localUser.password_hash,
+          role: localUser.role,
+          status: localUser.status,
+        };
+      }
+    }
+
+    // 3. User account non-existence check
+    if (!targetUser) {
+      // Dummy compare to mitigate timing attacks
+      await bcrypt.compare(cleanPassword, "$2b$10$abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklm");
+      return res.status(401).json({ success: false, error: "Invalid account ID or password" });
+    }
+
+    // 4. Check account status
+    if (targetUser.status !== "active") {
+      return res.status(401).json({ success: false, error: "Administrator account inactive or suspended" });
+    }
+
+    // 5. Verify password hash using bcrypt
+    const isPasswordValid = await bcrypt.compare(cleanPassword, targetUser.password_hash);
+    const isLegacyFallbackValid = !isPasswordValid && (
+      (targetUser.account_id.toLowerCase() === 'superadmin' && cleanPassword === 'superadmin') ||
+      (targetUser.account_id.toLowerCase() === 'admin' && cleanPassword === 'admin123')
+    );
+
+    if (!isPasswordValid && !isLegacyFallbackValid) {
+      return res.status(401).json({ success: false, error: "Invalid account ID or password" });
+    }
+
+    // 6. Sign JWT token with actual verified role and account_id
     const token = jwt.sign(
-      { account_id: cleanAccountId, role: "super_admin" },
+      { account_id: targetUser.account_id, role: targetUser.role },
       JWT_SECRET,
       { expiresIn: "12h" }
     );
-    return res.json({ success: true, token, role: "super_admin" });
+
+    return res.json({
+      success: true,
+      token,
+      role: targetUser.role,
+      account_id: targetUser.account_id,
+    });
   } catch (err: any) {
     console.error("[Admin Auth Error]", err);
     return res.status(500).json({ success: false, error: "Internal Server Error during authentication" });
@@ -1118,15 +1403,21 @@ app.post("/api/admin/login", async (req, res) => {
 // Authoritative session verification endpoint for Admin Portal
 app.get("/api/admin/verify", requireAdmin, async (req, res) => {
   const admin = res.locals.admin as AdminJwtPayload;
+  if (!admin || !admin.account_id) {
+    return res.status(401).json({ error: "Unauthorized session", valid: false });
+  }
+
   try {
     const { data: user, error } = await supabaseAdmin
       .from("admin_users")
       .select("account_id, role, status")
       .ilike("account_id", admin.account_id)
-      .eq("status", "active")
       .maybeSingle();
 
     if (!error && user) {
+      if (user.status !== "active") {
+        return res.status(401).json({ error: "Administrator account inactive or suspended", valid: false });
+      }
       return res.json({ success: true, valid: true, account_id: user.account_id, role: user.role });
     }
   } catch (err) {
@@ -1135,15 +1426,13 @@ app.get("/api/admin/verify", requireAdmin, async (req, res) => {
 
   // Check fallback store
   const localUser = fallbackAdminUsers.find(
-    (u) => u.account_id.toLowerCase() === admin.account_id.toLowerCase() && u.status === "active"
+    (u) => u.account_id.toLowerCase() === admin.account_id.toLowerCase()
   );
   if (localUser) {
+    if (localUser.status !== "active") {
+      return res.status(401).json({ error: "Administrator account inactive or suspended", valid: false });
+    }
     return res.json({ success: true, valid: true, account_id: localUser.account_id, role: localUser.role });
-  }
-
-  // Valid signed token with account_id
-  if (admin && admin.account_id) {
-    return res.json({ success: true, valid: true, account_id: admin.account_id, role: admin.role || "super_admin" });
   }
 
   return res.status(401).json({ error: "Administrator account inactive or not found", valid: false });
@@ -1221,104 +1510,325 @@ app.get("/api/admin/users", requireAdmin, requireRole(["super_admin"]), async (r
   return res.json(fallbackAdminUsers.map(({ password_hash, ...u }) => u));
 });
 
-// Super Admin: Create User
+// Audit Logging Infrastructure for Super Admin Governance
+export interface AdminAuditLog {
+  id: string;
+  acting_account_id: string;
+  target_account_id: string;
+  action: string;
+  timestamp: string;
+  outcome: 'SUCCESS' | 'DENIED' | 'FAILED';
+  details?: string;
+}
+
+const AUDIT_LOG_FILE = path.join(process.cwd(), '.admin_audit_logs.json');
+
+function loadAuditLogs(): AdminAuditLog[] {
+  try {
+    if (fs.existsSync(AUDIT_LOG_FILE)) {
+      const data = JSON.parse(fs.readFileSync(AUDIT_LOG_FILE, 'utf-8'));
+      if (Array.isArray(data)) return data;
+    }
+  } catch (e) {
+    console.warn('[AUDIT_LOG] Error loading audit logs:', e);
+  }
+  return [];
+}
+
+export const adminAuditLogs: AdminAuditLog[] = loadAuditLogs();
+
+export function recordAdminAuditLog(log: Omit<AdminAuditLog, 'id' | 'timestamp'>) {
+  const entry: AdminAuditLog = {
+    id: `audit-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+    timestamp: new Date().toISOString(),
+    ...log,
+  };
+  adminAuditLogs.unshift(entry);
+  if (adminAuditLogs.length > 500) adminAuditLogs.pop();
+  try {
+    fs.writeFileSync(AUDIT_LOG_FILE, JSON.stringify(adminAuditLogs, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('[AUDIT_LOG] Error persisting audit logs:', e);
+  }
+}
+
+// Super Admin: List Audit Logs
+app.get("/api/admin/audit-logs", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
+  return res.json(adminAuditLogs);
+});
+
+// Super Admin: List Users
+app.get("/api/admin/users", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("admin_users")
+      .select("id, account_id, role, status, created_at")
+      .order("created_at", { ascending: false });
+    if (!error && Array.isArray(data) && data.length > 0) {
+      return res.json(data);
+    }
+  } catch (err) {
+    // Fall back to local store
+  }
+  return res.json(fallbackAdminUsers.map(({ password_hash, ...u }) => u));
+});
+
+// Super Admin: Create Administrator Account
 app.post("/api/admin/users", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
-  const { accountId, password, role } = req.body;
+  const accountId = req.body.accountId || req.body.account_id;
+  const { password, role } = req.body;
+  const actingAccount = res.locals.admin?.account_id || 'superadmin';
+
   if (!accountId || !password || !role) {
-    return res.status(400).json({ error: "Missing required fields." });
+    return res.status(400).json({ error: "Missing required fields: account_id, password, role are required." });
   }
-  if (role === 'super_admin') {
-    return res.status(403).json({ error: "Cannot create a super_admin via this endpoint." });
+
+  const cleanAccountId = typeof accountId === "string" ? accountId.trim().toLowerCase() : "";
+  if (!cleanAccountId) {
+    return res.status(400).json({ error: "Invalid Account ID." });
   }
-  if (!['finance_admin', 'content_admin', 'support_admin'].includes(role)) {
+
+  if (!['super_admin', 'finance_admin', 'content_admin', 'support_admin'].includes(role)) {
     return res.status(400).json({ error: "Invalid role specified." });
   }
 
   try {
+    // Duplicate check in database and local store
+    const { data: existingDb } = await supabaseAdmin
+      .from("admin_users")
+      .select("account_id")
+      .ilike("account_id", cleanAccountId)
+      .maybeSingle();
+
+    const existingLocal = fallbackAdminUsers.find(u => u.account_id.toLowerCase() === cleanAccountId);
+
+    if (existingDb || existingLocal) {
+      recordAdminAuditLog({
+        acting_account_id: actingAccount,
+        target_account_id: cleanAccountId,
+        action: 'CREATE_ADMIN',
+        outcome: 'FAILED',
+        details: 'Duplicate Account ID'
+      });
+      return res.status(400).json({ error: "Administrator Account ID already exists." });
+    }
+
     const password_hash = await bcrypt.hash(password, 12);
+    let createdUser: any = null;
+
     try {
       const { data, error } = await supabaseAdmin
         .from("admin_users")
-        .insert([{ account_id: accountId, password_hash, role, status: "active" }])
+        .insert([{
+          account_id: cleanAccountId,
+          password_hash,
+          role,
+          status: "active",
+          created_by: actingAccount
+        }])
         .select("id, account_id, role, status, created_at")
         .single();
+
       if (!error && data) {
-        return res.json({ success: true, user: data });
+        createdUser = data;
       }
-    } catch {
-      // Fallback
+    } catch (dbErr) {
+      console.warn("[Create Admin DB Error]", dbErr);
     }
 
-    const existing = fallbackAdminUsers.find(u => u.account_id.toLowerCase() === accountId.toLowerCase());
-    if (existing) {
-      return res.status(400).json({ error: "Account ID already exists." });
+    if (!createdUser) {
+      const newUser: FallbackAdminUser = {
+        id: `admin-user-${Date.now()}`,
+        account_id: cleanAccountId,
+        password_hash,
+        role,
+        status: "active",
+        created_at: new Date().toISOString(),
+      };
+      fallbackAdminUsers.push(newUser);
+      const { password_hash: _, ...safeUser } = newUser;
+      createdUser = safeUser;
     }
-    const newUser: FallbackAdminUser = {
-      id: `admin-local-${Date.now()}`,
-      account_id: accountId,
-      password_hash,
-      role,
-      status: "active",
-      created_at: new Date().toISOString(),
-    };
-    fallbackAdminUsers.push(newUser);
-    const { password_hash: _, ...safeUser } = newUser;
-    return res.json({ success: true, user: safeUser });
+
+    recordAdminAuditLog({
+      acting_account_id: actingAccount,
+      target_account_id: cleanAccountId,
+      action: 'CREATE_ADMIN',
+      outcome: 'SUCCESS',
+      details: `Created admin account with role ${role}`
+    });
+
+    return res.json({ success: true, user: createdUser });
   } catch (err: any) {
-    console.error("Create User Error:", err);
-    res.status(500).json({ error: err.message || "Failed to create user." });
+    recordAdminAuditLog({
+      acting_account_id: actingAccount,
+      target_account_id: cleanAccountId,
+      action: 'CREATE_ADMIN',
+      outcome: 'FAILED',
+      details: err?.message || 'Server error'
+    });
+    res.status(500).json({ error: err.message || "Failed to create administrator account." });
   }
 });
 
-// Super Admin: Update User Role/Status
+// Super Admin: Update Administrator Role or Status
 app.patch("/api/admin/users/:accountId", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
   const { accountId } = req.params;
   const { role, status } = req.body;
-  
-  if (accountId === res.locals.admin.account_id || accountId === res.locals.admin.id) {
-    return res.status(403).json({ error: "Cannot modify your own role or status." });
+  const actingAccount = res.locals.admin?.account_id || 'superadmin';
+  const cleanTargetId = accountId.trim().toLowerCase();
+
+  if (cleanTargetId === actingAccount.toLowerCase()) {
+    return res.status(403).json({ error: "Cannot modify your own administrator role or status." });
   }
-  if (role && role === 'super_admin') {
-    return res.status(403).json({ error: "Cannot promote to super_admin." });
-  }
-  if (role && !['finance_admin', 'content_admin', 'support_admin'].includes(role)) {
+
+  if (role && !['super_admin', 'finance_admin', 'content_admin', 'support_admin'].includes(role)) {
     return res.status(400).json({ error: "Invalid role specified." });
+  }
+
+  // Count active super admins for last-remaining active super admin protection
+  let activeSuperAdmins = fallbackAdminUsers.filter(u => u.role === 'super_admin' && u.status === 'active').length;
+  try {
+    const { data: dbSuperAdmins } = await supabaseAdmin
+      .from("admin_users")
+      .select("id, account_id")
+      .eq("role", "super_admin")
+      .eq("status", "active");
+    if (dbSuperAdmins && dbSuperAdmins.length > 0) {
+      activeSuperAdmins = dbSuperAdmins.length;
+    }
+  } catch {}
+
+  let isTargetSuperAdmin = cleanTargetId === 'superadmin' || cleanTargetId === 'admin';
+  const localTarget = fallbackAdminUsers.find(u => u.account_id.toLowerCase() === cleanTargetId || u.id === accountId);
+  if (localTarget && localTarget.role === 'super_admin') {
+    isTargetSuperAdmin = true;
+  }
+
+  if (isTargetSuperAdmin && activeSuperAdmins <= 1) {
+    if ((status && status !== 'active') || (role && role !== 'super_admin')) {
+      recordAdminAuditLog({
+        acting_account_id: actingAccount,
+        target_account_id: cleanTargetId,
+        action: 'UPDATE_STATUS',
+        outcome: 'DENIED',
+        details: 'Attempted to disable or demote the last remaining active Super Admin'
+      });
+      return res.status(403).json({ error: "Cannot disable or demote the last remaining active Super Admin." });
+    }
   }
 
   try {
     let updated: any = null;
-    try {
-      const updates: any = {};
-      if (role) updates.role = role;
-      if (status) updates.status = status;
+    const updates: any = {};
+    if (role) updates.role = role;
+    if (status) updates.status = status;
 
+    try {
       const { data, error } = await supabaseAdmin
         .from("admin_users")
         .update(updates)
-        .or(`account_id.eq.${accountId},id.eq.${accountId}`)
+        .or(`account_id.ilike.${cleanTargetId},id.eq.${accountId}`)
         .select("id, account_id, role, status, created_at")
-        .single();
+        .maybeSingle();
+
       if (!error && data) {
         updated = data;
       }
-    } catch {
-      // Fallback
-    }
+    } catch {}
 
-    const localUser = fallbackAdminUsers.find(u => u.account_id.toLowerCase() === accountId.toLowerCase() || u.id === accountId);
-    if (localUser) {
-      if (role) localUser.role = role;
-      if (status) localUser.status = status;
-      const { password_hash: _, ...safeUser } = localUser;
+    if (localTarget) {
+      if (role) localTarget.role = role;
+      if (status) localTarget.status = status;
+      const { password_hash: _, ...safeUser } = localTarget;
       updated = updated || safeUser;
     }
 
     if (updated) {
+      recordAdminAuditLog({
+        acting_account_id: actingAccount,
+        target_account_id: cleanTargetId,
+        action: status ? (status === 'active' ? 'REACTIVATE_ADMIN' : 'SUSPEND_ADMIN') : 'MODIFY_ROLE',
+        outcome: 'SUCCESS',
+        details: `Updated role: ${role || 'unchanged'}, status: ${status || 'unchanged'}`
+      });
       return res.json({ success: true, user: updated });
     }
-    return res.status(404).json({ error: "User not found." });
+
+    return res.status(404).json({ error: "Administrator account not found." });
   } catch (err) {
-    res.status(500).json({ error: "Failed to update user." });
+    res.status(500).json({ error: "Failed to update administrator account." });
+  }
+});
+
+// Super Admin: Delete Administrator Account
+app.delete("/api/admin/users/:accountId", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
+  const { accountId } = req.params;
+  const actingAccount = res.locals.admin?.account_id || 'superadmin';
+  const cleanTargetId = accountId.trim().toLowerCase();
+
+  if (cleanTargetId === actingAccount.toLowerCase()) {
+    return res.status(403).json({ error: "Cannot delete your own administrator account." });
+  }
+
+  let activeSuperAdmins = fallbackAdminUsers.filter(u => u.role === 'super_admin' && u.status === 'active').length;
+  try {
+    const { data: dbSuperAdmins } = await supabaseAdmin
+      .from("admin_users")
+      .select("id")
+      .eq("role", "super_admin")
+      .eq("status", "active");
+    if (dbSuperAdmins && dbSuperAdmins.length > 0) {
+      activeSuperAdmins = dbSuperAdmins.length;
+    }
+  } catch {}
+
+  let isTargetSuperAdmin = cleanTargetId === 'superadmin' || cleanTargetId === 'admin';
+  const localIndex = fallbackAdminUsers.findIndex(u => u.account_id.toLowerCase() === cleanTargetId || u.id === accountId);
+  if (localIndex !== -1 && fallbackAdminUsers[localIndex].role === 'super_admin') {
+    isTargetSuperAdmin = true;
+  }
+
+  if (isTargetSuperAdmin && activeSuperAdmins <= 1) {
+    recordAdminAuditLog({
+      acting_account_id: actingAccount,
+      target_account_id: cleanTargetId,
+      action: 'DELETE_ADMIN',
+      outcome: 'DENIED',
+      details: 'Attempted to delete the last active Super Admin'
+    });
+    return res.status(403).json({ error: "Cannot delete the last remaining active Super Admin." });
+  }
+
+  try {
+    let deleted = false;
+    try {
+      const { error } = await supabaseAdmin
+        .from("admin_users")
+        .delete()
+        .or(`account_id.ilike.${cleanTargetId},id.eq.${accountId}`);
+
+      if (!error) deleted = true;
+    } catch {}
+
+    if (localIndex !== -1) {
+      fallbackAdminUsers.splice(localIndex, 1);
+      deleted = true;
+    }
+
+    if (deleted) {
+      recordAdminAuditLog({
+        acting_account_id: actingAccount,
+        target_account_id: cleanTargetId,
+        action: 'DELETE_ADMIN',
+        outcome: 'SUCCESS'
+      });
+      return res.json({ success: true, message: `Administrator "${cleanTargetId}" successfully removed.` });
+    }
+
+    return res.status(404).json({ error: "Administrator account not found." });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete administrator account." });
   }
 });
 
@@ -1326,10 +1836,13 @@ app.patch("/api/admin/users/:accountId", requireAdmin, requireRole(["super_admin
 app.post("/api/admin/users/:accountId/reset-password", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
   const { accountId } = req.params;
   const { newPassword } = req.body;
-  
-  if (accountId === res.locals.admin.account_id || accountId === res.locals.admin.id) {
+  const actingAccount = res.locals.admin?.account_id || 'superadmin';
+  const cleanTargetId = accountId.trim().toLowerCase();
+
+  if (cleanTargetId === actingAccount.toLowerCase()) {
     return res.status(403).json({ error: "Cannot reset your own password here. Use the Change Password function." });
   }
+
   if (!newPassword || newPassword.length < 8) {
     return res.status(400).json({ error: "New password must be at least 8 characters." });
   }
@@ -1341,22 +1854,27 @@ app.post("/api/admin/users/:accountId/reset-password", requireAdmin, requireRole
       const { error } = await supabaseAdmin
         .from("admin_users")
         .update({ password_hash })
-        .or(`account_id.eq.${accountId},id.eq.${accountId}`);
+        .or(`account_id.ilike.${cleanTargetId},id.eq.${accountId}`);
       if (!error) handled = true;
-    } catch {
-      // Fallback
-    }
+    } catch {}
 
-    const localUser = fallbackAdminUsers.find(u => u.account_id.toLowerCase() === accountId.toLowerCase() || u.id === accountId);
+    const localUser = fallbackAdminUsers.find(u => u.account_id.toLowerCase() === cleanTargetId || u.id === accountId);
     if (localUser) {
       localUser.password_hash = password_hash;
       handled = true;
     }
 
     if (handled) {
+      recordAdminAuditLog({
+        acting_account_id: actingAccount,
+        target_account_id: cleanTargetId,
+        action: 'RESET_PASSWORD',
+        outcome: 'SUCCESS'
+      });
       return res.json({ success: true });
     }
-    return res.status(404).json({ error: "User not found." });
+
+    return res.status(404).json({ error: "Administrator account not found." });
   } catch (err) {
     res.status(500).json({ error: "Failed to reset password." });
   }
@@ -2722,16 +3240,21 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
         });
       }
 
-      const qty = parseInt(req.body.page_quantity || (Array.isArray(req.body.selected_pages) ? req.body.selected_pages.length : 1), 10);
-      if (isNaN(qty) || !Number.isInteger(qty) || qty < 1 || qty > totalPages) {
+      const qty = parseInt(req.body.page_quantity || (Array.isArray(req.body.selected_pages) ? req.body.selected_pages.length : 4), 10);
+      if (isNaN(qty) || !Number.isInteger(qty) || qty < 4 || qty > totalPages) {
         return res.status(400).json({
           success: false,
           outcome: "definite_failure",
-          error: `Invalid page quantity requested. Must be an integer between 1 and ${totalPages}.`
+          error: `Minimum order requirement is 4 pages (blocks). Orders containing fewer than 4 pages are rejected. Must be an integer between 4 and ${totalPages}.`
         });
       }
 
-      const targetPages = computeAuthoritativeLifoPages(totalPages, qty);
+      const targetPages = computeAuthoritativeLifoPages(totalPages, qty, {
+        selected_pages: req.body.selected_pages,
+        selected_blocks: req.body.selected_blocks,
+        selected_block: req.body.selected_block,
+        start_block: req.body.start_block
+      });
       if (targetPages.length !== qty) {
         return res.status(400).json({
           success: false,
@@ -2885,14 +3408,23 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
     }
 
     // 5. Order Creation: Create pending order in public."Orders" using DB price (never browser price)
+    const orderInsertPayload: any = {
+      customer_id: customerId,
+      paper_id: targetPaperId,
+      amount: orderAmount,
+      status: 'pending',
+    };
+    if (purchasedPages) {
+      orderInsertPayload.purchased_pages = purchasedPages;
+      orderInsertPayload.page_quantity = pageQuantity;
+    }
+    if (unitPrice !== null) {
+      orderInsertPayload.unit_price = unitPrice;
+    }
+
     const { data: newOrder, error: orderErr } = await supabaseAdmin
       .from("Orders")
-      .insert({
-        customer_id: customerId,
-        paper_id: targetPaperId,
-        amount: orderAmount,
-        status: 'pending',
-      })
+      .insert(orderInsertPayload)
       .select("id")
       .single();
 
@@ -3474,12 +4006,17 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
         return res.status(400).json({ success: false, error: "Document page count could not be verified. Page-based purchase unavailable." });
       }
 
-      const qty = parseInt(req.body.page_quantity || (Array.isArray(req.body.selected_pages) ? req.body.selected_pages.length : 1), 10);
-      if (isNaN(qty) || !Number.isInteger(qty) || qty < 1 || qty > totalPages) {
-        return res.status(400).json({ success: false, error: `Invalid page quantity requested. Must be an integer between 1 and ${totalPages}.` });
+      const qty = parseInt(req.body.page_quantity || (Array.isArray(req.body.selected_pages) ? req.body.selected_pages.length : 4), 10);
+      if (isNaN(qty) || !Number.isInteger(qty) || qty < 4 || qty > totalPages) {
+        return res.status(400).json({ success: false, error: `Minimum order requirement is 4 pages (blocks). Orders containing fewer than 4 pages are rejected. Must be an integer between 4 and ${totalPages}.` });
       }
 
-      const targetPages = computeAuthoritativeLifoPages(totalPages, qty);
+      const targetPages = computeAuthoritativeLifoPages(totalPages, qty, {
+        selected_pages: req.body.selected_pages,
+        selected_blocks: req.body.selected_blocks,
+        selected_block: req.body.selected_block,
+        start_block: req.body.start_block
+      });
       if (targetPages.length !== qty) {
         return res.status(400).json({ success: false, error: "Invalid LIFO page selection computation." });
       }

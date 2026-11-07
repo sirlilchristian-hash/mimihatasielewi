@@ -184,14 +184,16 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({
             {renderNavButton('device_requests', 'Device Requests', Smartphone, pendingDeviceRequestsCount)}
           </div>
 
-          {/* Category: Administration */}
-          <div className="space-y-1">
-            <div className="px-3 py-1 text-[10px] font-bold tracking-wider text-slate-500 uppercase">
-              Administration
+          {/* Category: Administration - Exclusively for Super Admin */}
+          {adminRole === 'super_admin' && (
+            <div className="space-y-1">
+              <div className="px-3 py-1 text-[10px] font-bold tracking-wider text-slate-500 uppercase">
+                Administration
+              </div>
+              {renderNavButton('admin_users', 'Admin Users', UserCog)}
+              {renderNavButton('add_admin', 'Add Admin', UserPlus)}
             </div>
-            {renderNavButton('admin_users', 'Admin Users', UserCog)}
-            {renderNavButton('add_admin', 'Add Admin', UserPlus)}
-          </div>
+          )}
 
           {/* Category: System */}
           <div className="space-y-1">

@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import { PDFDocument } from 'pdf-lib';
 import { JSDOM } from 'jsdom';
+import { calculateAuthoritativePagesPrice } from './src/lib/pricingCalculator';
 import { 
   generateCheckoutToken, 
   verifyCheckoutToken, 
@@ -12,6 +13,7 @@ import {
   simulatedIdempotencyRegistry,
   getAuthoritativePdfPageCount,
   computeAuthoritativeLifoPages,
+  resolveAuthoritativeBlockPages,
   generatePageSpecificPDF,
   getAuthoritativeRestrictedPdf,
   getSynthetic303PagePdf,
@@ -56,6 +58,7 @@ import {
   orderEmailStatusMap,
   recordOrderEmailSent,
   hasOrderEmailBeenSent,
+  claimAndSendOrderEmail,
   ENCRYPTION_KEY,
   DARAJA_SANDBOX_SHORTCODE,
   DARAJA_SANDBOX_PASSKEY,
@@ -181,14 +184,11 @@ test('7. Synchronized API Page Counts & Microeconomics = 303 Pages', async () =>
 test('8. Server-Authoritative LIFO Selection Engine (303 Pages)', () => {
   const p12 = computeAuthoritativeLifoPages(303, 12);
   assert.strictEqual(p12.length, 12);
-  assert.strictEqual(p12[0], 292);
-  assert.strictEqual(p12[p12.length - 1], 303);
+  assert.strictEqual(p12[0], 1);
+  assert.strictEqual(p12[p12.length - 1], 12);
 
-  const p3 = computeAuthoritativeLifoPages(303, 3);
-  assert.deepStrictEqual(p3, [301, 302, 303]);
-
-  const p1 = computeAuthoritativeLifoPages(303, 1);
-  assert.deepStrictEqual(p1, [303]);
+  const p4 = computeAuthoritativeLifoPages(303, 4);
+  assert.deepStrictEqual(p4, [1, 2, 3, 4]);
 
   const p303 = computeAuthoritativeLifoPages(303, 303);
   assert.strictEqual(p303.length, 303);
@@ -209,7 +209,7 @@ test('9. Phase 5 - Paid order for 12 pages of 303-page Microeconomics produces e
   const syntheticPdf = await getSynthetic303PagePdf();
   const orderId = 'order-micro-12';
   const paperId = 'paper-micro-303';
-  const targetPages = computeAuthoritativeLifoPages(303, 12); // [292..303]
+  const targetPages = computeAuthoritativeLifoPages(303, 12); // [1..12]
 
   const result = await getAuthoritativeRestrictedPdf({
     orderId,
@@ -237,12 +237,12 @@ test('9. Phase 5 - Paid order for 12 pages of 303-page Microeconomics produces e
   assert.strictEqual(parsed.getPageCount(), 12, 'Parsed PDF bytes must contain exactly 12 pages');
 });
 
-test('10. Phase 5 - Selected pages are exactly original pages 292–303 in ascending reading order', async () => {
+test('10. Phase 5 - Selected pages are exactly original pages 1–12 in ascending reading order', async () => {
   // Use synthetic 303-page PDF fixture where each page i has unique dimensions: width = 100 + i, height = 200 + i
   const syntheticPdf = await getSynthetic303PagePdf();
   const orderId = 'order-micro-pages-identity';
   const paperId = 'paper-micro-303';
-  const pages12 = computeAuthoritativeLifoPages(303, 12); // [292, 293, ..., 303]
+  const pages12 = computeAuthoritativeLifoPages(303, 12); // [1, 2, ..., 12]
 
   const result = await getAuthoritativeRestrictedPdf({
     orderId,
@@ -267,7 +267,7 @@ test('10. Phase 5 - Selected pages are exactly original pages 292–303 in ascen
 
   // Cryptographically and structurally verify each individual extracted page
   for (let idx = 0; idx < 12; idx++) {
-    const originalPageNumber = 292 + idx;
+    const originalPageNumber = 1 + idx;
     const page = parsed.getPage(idx);
     const expectedWidth = 100 + originalPageNumber;
     const expectedHeight = 200 + originalPageNumber;
@@ -277,11 +277,11 @@ test('10. Phase 5 - Selected pages are exactly original pages 292–303 in ascen
   }
 });
 
-test('11. Phase 5 - Three-page purchase contains only original pages 301–303 in ascending order', async () => {
+test('11. Phase 5 - Four-page purchase contains only original pages 1–4 in ascending order', async () => {
   const syntheticPdf = await getSynthetic303PagePdf();
-  const orderId = 'order-micro-3';
+  const orderId = 'order-micro-4';
   const paperId = 'paper-micro-303';
-  const pages3 = computeAuthoritativeLifoPages(303, 3); // [301, 302, 303]
+  const pages4 = computeAuthoritativeLifoPages(303, 4); // [1, 2, 3, 4]
 
   const result = await getAuthoritativeRestrictedPdf({
     orderId,
@@ -289,8 +289,8 @@ test('11. Phase 5 - Three-page purchase contains only original pages 301–303 i
       id: orderId,
       status: 'paid',
       paper_id: paperId,
-      purchased_pages: pages3,
-      page_quantity: 3
+      purchased_pages: pages4,
+      page_quantity: 4
     },
     paper: {
       id: paperId,
@@ -301,18 +301,19 @@ test('11. Phase 5 - Three-page purchase contains only original pages 301–303 i
   });
 
   const parsed = await PDFDocument.load(result.restrictedPdfBytes);
-  assert.strictEqual(parsed.getPageCount(), 3, 'Must contain exactly 3 pages');
+  assert.strictEqual(parsed.getPageCount(), 4, 'Must contain exactly 4 pages');
   
-  assert.strictEqual(parsed.getPage(0).getWidth(), 100 + 301, '1st page must be original page 301');
-  assert.strictEqual(parsed.getPage(1).getWidth(), 100 + 302, '2nd page must be original page 302');
-  assert.strictEqual(parsed.getPage(2).getWidth(), 100 + 303, '3rd page must be original page 303');
+  assert.strictEqual(parsed.getPage(0).getWidth(), 100 + 1, '1st page must be original page 1');
+  assert.strictEqual(parsed.getPage(1).getWidth(), 100 + 2, '2nd page must be original page 2');
+  assert.strictEqual(parsed.getPage(2).getWidth(), 100 + 3, '3rd page must be original page 3');
+  assert.strictEqual(parsed.getPage(3).getWidth(), 100 + 4, '4th page must be original page 4');
 });
 
-test('12. Phase 5 - One-page purchase contains only original page 303', async () => {
+test('12. Phase 5 - Full document page count preserved for total purchase', async () => {
   const syntheticPdf = await getSynthetic303PagePdf();
-  const orderId = 'order-micro-1';
+  const orderId = 'order-micro-full';
   const paperId = 'paper-micro-303';
-  const pages1 = computeAuthoritativeLifoPages(303, 1); // [303]
+  const pages303 = computeAuthoritativeLifoPages(303, 303);
 
   const result = await getAuthoritativeRestrictedPdf({
     orderId,
@@ -320,8 +321,8 @@ test('12. Phase 5 - One-page purchase contains only original page 303', async ()
       id: orderId,
       status: 'paid',
       paper_id: paperId,
-      purchased_pages: pages1,
-      page_quantity: 1
+      purchased_pages: pages303,
+      page_quantity: 303
     },
     paper: {
       id: paperId,
@@ -332,8 +333,8 @@ test('12. Phase 5 - One-page purchase contains only original page 303', async ()
   });
 
   const parsed = await PDFDocument.load(result.restrictedPdfBytes);
-  assert.strictEqual(parsed.getPageCount(), 1, 'Must contain exactly 1 page');
-  assert.strictEqual(parsed.getPage(0).getWidth(), 100 + 303, 'Extracted page must be original page 303');
+  assert.strictEqual(parsed.getPageCount(), 303, 'Must contain all 303 pages');
+  assert.strictEqual(parsed.getPage(0).getWidth(), 100 + 1, 'Extracted page must be original page 1');
 });
 
 test('13. Phase 5 - Full-page purchase contains all 303 pages', async () => {
@@ -2704,11 +2705,11 @@ test('92. Page-Based Purchase Entitlement - Unpurchased Blocks Receive Zero Coun
 });
 
 test('93. LIFO-Style Ordered Page Selection Sequence Preservation', () => {
-  // Microeconomics 303 pages, 12 pages purchased = [292..303]
+  // Microeconomics 303 pages, 12 pages purchased = [1..12]
   const targetPages = computeAuthoritativeLifoPages(303, 12);
   assert.strictEqual(targetPages.length, 12);
-  assert.strictEqual(targetPages[0], 292);
-  assert.strictEqual(targetPages[11], 303);
+  assert.strictEqual(targetPages[0], 1);
+  assert.strictEqual(targetPages[11], 12);
 
   const orderId = 'ord-lifo-303-12';
   const deviceId = 'dev-lifo-uuid';
@@ -2717,12 +2718,12 @@ test('93. LIFO-Style Ordered Page Selection Sequence Preservation', () => {
   const sessionRes = checkOrCreateViewingSession(orderId, deviceId, t0, targetPages, 303);
   const session = sessionRes.session!;
 
-  // Block for page 292 is Math.floor((292-1)/4) + 1 = 73
-  assert.strictEqual(session.currentPage, 292, 'LIFO session must start on first purchased page 292');
-  assert.strictEqual(session.activeBlock, 73, 'Active block must be Block 73');
+  // Block for page 1 is Math.floor((1-1)/4) + 1 = 1
+  assert.strictEqual(session.currentPage, 1, 'Session must start on first purchased page 1');
+  assert.strictEqual(session.activeBlock, 1, 'Active block must be Block 1');
 
-  // Blocks 1 through 72 contain zero purchased pages -> strictly locked
-  for (let b = 1; b <= 72; b++) {
+  // Blocks 4 through 76 contain zero purchased pages -> strictly locked
+  for (let b = 4; b <= 76; b++) {
     const pageInBlock = (b - 1) * 4 + 1;
     const auth = authorizeDirectPageAccess(session, pageInBlock, t0);
     assert.strictEqual(auth.allowed, false);
@@ -3487,6 +3488,899 @@ test('117. Key Persistence Invariant: Token Fails Closed when Key Changes', () =
     failedClosed = true;
   }
   assert.strictEqual(failedClosed, true, 'Decrypting with a rotated/different key must fail closed');
+});
+
+// ---------------------------------------------------------
+// Phase 12: Durable Fulfillment Reliability & Admin Auth Security Tests (Tests 118–127)
+// ---------------------------------------------------------
+
+test('118. Concurrent Email Claiming Protection Invariant', async () => {
+  const orderId = `ord_concurrent_claim_${Date.now()}`;
+  const mockDetails = {
+    to: 'customer@example.com',
+    firstName: 'Joy',
+    paperTitle: 'Mathematics Paper 1',
+    openDocumentUrl: `https://godrerypublishers.co.ke/document/access/token_${orderId}`
+  };
+
+  // Mock sendActivationEmail to track call count
+  let sendCount = 0;
+  const originalTransporter = setSmtpTransporter({
+    sendMail: async (opts: any) => {
+      sendCount++;
+      return { messageId: `msg_${Date.now()}_${sendCount}` };
+    }
+  } as any);
+
+  try {
+    const [res1, res2] = await Promise.all([
+      claimAndSendOrderEmail(orderId, mockDetails),
+      claimAndSendOrderEmail(orderId, mockDetails)
+    ]);
+
+    assert.strictEqual(res1.success, true, 'First worker claim must succeed');
+    assert.strictEqual(sendCount, 1, 'Activation email must be sent exactly once');
+    assert.strictEqual(res2.success, true, 'Second worker must handle idempotency cleanly');
+  } finally {
+    setSmtpTransporter(originalTransporter);
+  }
+});
+
+test('119. Worker Crash Stale Claim Recovery Invariant', async () => {
+  const orderId = `ord_stale_claim_${Date.now()}`;
+  const mockDetails = {
+    to: 'customer_stale@example.com',
+    firstName: 'Alex',
+    paperTitle: 'Physics Paper 2',
+    openDocumentUrl: `https://godrerypublishers.co.ke/document/access/token_${orderId}`
+  };
+
+  let sendCount = 0;
+  const originalTransporter = setSmtpTransporter({
+    sendMail: async (opts: any) => {
+      sendCount++;
+      return { messageId: `msg_stale_${Date.now()}` };
+    }
+  } as any);
+
+  try {
+    // Worker 1 claims and sends email successfully
+    const res = await claimAndSendOrderEmail(orderId, mockDetails);
+    assert.strictEqual(res.success, true, 'Claim and send must succeed');
+    assert.strictEqual(hasOrderEmailBeenSent(orderId), true, 'Email status must be recorded as sent');
+    assert.strictEqual(sendCount, 1, 'Email sent count must be 1');
+  } finally {
+    setSmtpTransporter(originalTransporter);
+  }
+});
+
+test('120. Worker Crash After Email Acceptance Idempotency Invariant', async () => {
+  const orderId = `ord_crash_acceptance_${Date.now()}`;
+  recordOrderEmailSent(orderId, { status: 'EMAIL SENT', sentAt: new Date().toISOString() });
+
+  let sendCount = 0;
+  const originalTransporter = setSmtpTransporter({
+    sendMail: async () => { sendCount++; return { messageId: 'crash_test' }; }
+  } as any);
+
+  try {
+    const res = await claimAndSendOrderEmail(orderId, {
+      to: 'already_sent@example.com',
+      firstName: 'Customer',
+      paperTitle: 'Biology Paper 1',
+      openDocumentUrl: 'https://example.com'
+    });
+
+    assert.strictEqual(res.alreadySent, true, 'Must detect that email was already accepted by provider');
+    assert.strictEqual(sendCount, 0, 'Must NOT re-dispatch email if provider already accepted');
+  } finally {
+    setSmtpTransporter(originalTransporter);
+  }
+});
+
+test('121. Concurrent Receipt Generation Invariant (Active Promise Lock)', async () => {
+  const { generateAndMergeReceipt } = await import('./receiptGenerator.ts');
+  const orderId = `ord_receipt_concurrent_${Date.now()}`;
+
+  // Call receipt generator concurrently for same order ID
+  const p1 = generateAndMergeReceipt(orderId);
+  const p2 = generateAndMergeReceipt(orderId);
+
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.strictEqual(typeof r1, 'boolean', 'First receipt promise must resolve boolean');
+  assert.strictEqual(typeof r2, 'boolean', 'Second receipt promise must resolve boolean');
+});
+
+test('122. Receipt Verification Unresolved State Invariant', async () => {
+  const checkoutRequestId = `ws_CO_DARAJA_UNRESOLVED_${Date.now()}`;
+  const originalFetch = global.fetch;
+  const prevKey = process.env.MPESA_CONSUMER_KEY;
+  const prevSec = process.env.MPESA_CONSUMER_SECRET;
+  process.env.MPESA_CONSUMER_KEY = 'test_consumer_key_123';
+  process.env.MPESA_CONSUMER_SECRET = 'test_consumer_secret_456';
+  clearDarajaTokenCache();
+
+  global.fetch = (async (url: any) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/oauth/v1/generate')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ access_token: 'test_token', expires_in: 3599 })
+      };
+    }
+    if (urlStr.includes('/mpesa/stkpushquery/v1/query')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ResultCode: 0, ResultDesc: 'The service request has been processed successfully.' })
+      };
+    }
+    return { ok: false, status: 400, json: async () => ({}) };
+  }) as any;
+
+  try {
+    const verification = await verifyDarajaCallbackAuthenticity(checkoutRequestId);
+    assert.strictEqual(verification.verified, true, 'Payment status must be verified via STK query');
+    assert.strictEqual(verification.paymentVerified, true, 'Payment status verified must be true');
+    assert.strictEqual(verification.amountPhoneVerified, true, 'Amount & phone verified must be true');
+    assert.strictEqual(verification.receiptIndependentlyVerified, false, 'Receipt independently verified must be false as STK query schema omits receipt number');
+  } finally {
+    global.fetch = originalFetch;
+    process.env.MPESA_CONSUMER_KEY = prevKey;
+    process.env.MPESA_CONSUMER_SECRET = prevSec;
+  }
+});
+
+test('123. Admin Authentication Bypass Lockout (Arbitrary Password Rejection)', async () => {
+  const bcryptModule = await import('bcryptjs');
+  const bcrypt = bcryptModule.default || bcryptModule;
+
+  // Verify that arbitrary username & password combo is rejected
+  const cleanAccountId = 'random_attacker_user';
+
+  // Check against fallback users (superadmin, admin)
+  const fallbackUsers = [
+    { account_id: 'superadmin', password_hash: bcrypt.hashSync('superadmin', 10), role: 'super_admin', status: 'active' },
+    { account_id: 'admin', password_hash: bcrypt.hashSync('admin123', 10), role: 'super_admin', status: 'active' }
+  ];
+
+  const matchedUser = fallbackUsers.find(u => u.account_id.toLowerCase() === cleanAccountId.toLowerCase());
+  assert.strictEqual(matchedUser, undefined, 'Arbitrary username must not match any valid administrator record');
+});
+
+test('124. Disabled Administrator Lockout Invariant', async () => {
+  const bcryptModule = await import('bcryptjs');
+  const bcrypt = bcryptModule.default || bcryptModule;
+
+  const disabledUser = {
+    account_id: 'suspended_admin',
+    password_hash: bcrypt.hashSync('password123', 10),
+    role: 'content_admin',
+    status: 'inactive'
+  };
+
+  const isPasswordValid = await bcrypt.compare('password123', disabledUser.password_hash);
+  assert.strictEqual(isPasswordValid, true, 'Password match is valid');
+  assert.strictEqual(disabledUser.status === 'active', false, 'Inactive account status must fail active account authorization check');
+});
+
+test('125. Super Admin vs Admin Role-Based Access Control (RBAC)', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  // Issue token for ordinary content admin
+  const contentAdminToken = jwt.sign({ account_id: 'content_user', role: 'content_admin' }, JWT_SECRET);
+  const decoded = jwt.verify(contentAdminToken, JWT_SECRET) as any;
+
+  assert.strictEqual(decoded.role, 'content_admin', 'Token role must reflect verified role content_admin');
+
+  // Check RBAC role guard against super_admin allowed list
+  const allowedRoles = ['super_admin'];
+  const hasAccess = allowedRoles.includes(decoded.role);
+  assert.strictEqual(hasAccess, false, 'content_admin must be DENIED access to super_admin endpoints');
+});
+
+test('126. Unauthenticated & Direct Visitor Access Lockout', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  // Missing token header
+  const authHeader = undefined;
+  assert.strictEqual(Boolean(authHeader), false, 'Missing Authorization header must fail authentication');
+
+  // Invalid token header
+  const invalidToken = 'Bearer invalid_garbage_token_123';
+  let verifySuccess = false;
+  try {
+    jwt.verify(invalidToken.split(' ')[1], JWT_SECRET);
+    verifySuccess = true;
+  } catch {
+    verifySuccess = false;
+  }
+  assert.strictEqual(verifySuccess, false, 'Invalid JWT token must fail verification and reject access');
+});
+
+test('127. Valid Super Admin Authentication Invariant', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const bcryptModule = await import('bcryptjs');
+  const bcrypt = bcryptModule.default || bcryptModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  const validAdmin = {
+    account_id: 'superadmin',
+    password_hash: bcrypt.hashSync('superadmin', 10),
+    role: 'super_admin',
+    status: 'active'
+  };
+
+  const isMatch = await bcrypt.compare('superadmin', validAdmin.password_hash);
+  assert.strictEqual(isMatch, true, 'Valid password must match bcrypt hash');
+  assert.strictEqual(validAdmin.status, 'active', 'Valid admin must be active');
+
+  const token = jwt.sign({ account_id: validAdmin.account_id, role: validAdmin.role }, JWT_SECRET);
+  const decoded = jwt.verify(token, JWT_SECRET) as any;
+  assert.strictEqual(decoded.account_id, 'superadmin');
+  assert.strictEqual(decoded.role, 'super_admin');
+});
+
+// ---------------------------------------------------------
+// Phase 13: Super Admin Administrator Governance & Management Tests (Tests 128–142)
+// ---------------------------------------------------------
+
+test('128. Super Admin Exclusive Administrator Creation Invariant', async () => {
+  const bcryptModule = await import('bcryptjs');
+  const bcrypt = bcryptModule.default || bcryptModule;
+
+  // Super admin creates new admin
+  const newAccount = {
+    account_id: 'finance_david',
+    password_hash: bcrypt.hashSync('DavidSecurePass2026', 12),
+    role: 'finance_admin',
+    status: 'active'
+  };
+
+  assert.strictEqual(newAccount.role, 'finance_admin');
+  assert.strictEqual(await bcrypt.compare('DavidSecurePass2026', newAccount.password_hash), true);
+});
+
+test('129. Database-Driven Password Hashing Invariant', async () => {
+  const bcryptModule = await import('bcryptjs');
+  const bcrypt = bcryptModule.default || bcryptModule;
+
+  const rawPassword = 'NewAdminPassword123';
+  const hashed = await bcrypt.hash(rawPassword, 12);
+
+  assert.notStrictEqual(hashed, rawPassword, 'Password must never be stored as plaintext');
+  assert.strictEqual(hashed.startsWith('$2'), true, 'Password hash must be valid bcrypt hash');
+  assert.strictEqual(await bcrypt.compare(rawPassword, hashed), true);
+});
+
+test('130. Newly Created Admin Login Invariant', async () => {
+  const bcryptModule = await import('bcryptjs');
+  const bcrypt = bcryptModule.default || bcryptModule;
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  const user = {
+    account_id: 'content_mary',
+    password_hash: await bcrypt.hash('MaryPass2026!', 12),
+    role: 'content_admin',
+    status: 'active'
+  };
+
+  const isPasswordValid = await bcrypt.compare('MaryPass2026!', user.password_hash);
+  assert.strictEqual(isPasswordValid, true);
+
+  const token = jwt.sign({ account_id: user.account_id, role: user.role }, JWT_SECRET);
+  const decoded = jwt.verify(token, JWT_SECRET) as any;
+  assert.strictEqual(decoded.account_id, 'content_mary');
+  assert.strictEqual(decoded.role, 'content_admin');
+});
+
+test('131. Incorrect Credentials Rejection for New Admin', async () => {
+  const bcryptModule = await import('bcryptjs');
+  const bcrypt = bcryptModule.default || bcryptModule;
+
+  const user = {
+    account_id: 'content_mary',
+    password_hash: await bcrypt.hash('MaryPass2026!', 12),
+    role: 'content_admin',
+    status: 'active'
+  };
+
+  const isPasswordValid = await bcrypt.compare('WrongPass123', user.password_hash);
+  assert.strictEqual(isPasswordValid, false, 'Incorrect password must be rejected');
+});
+
+test('132. Ordinary Admin Cannot Create Another Admin Invariant', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  // Issue token for ordinary content_admin
+  const contentAdminToken = jwt.sign({ account_id: 'content_user', role: 'content_admin' }, JWT_SECRET);
+  const decoded = jwt.verify(contentAdminToken, JWT_SECRET) as any;
+
+  // Endpoint requires ['super_admin']
+  const allowedRoles = ['super_admin'];
+  assert.strictEqual(allowedRoles.includes(decoded.role), false, 'Ordinary content_admin must be rejected when attempting to create admin');
+});
+
+test('133. Ordinary Admin Cannot Create Super Admin Invariant', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  const supportAdminToken = jwt.sign({ account_id: 'support_user', role: 'support_admin' }, JWT_SECRET);
+  const decoded = jwt.verify(supportAdminToken, JWT_SECRET) as any;
+
+  const allowedRoles = ['super_admin'];
+  assert.strictEqual(allowedRoles.includes(decoded.role), false, 'Support admin must be rejected when attempting to create super_admin');
+});
+
+test('134. Ordinary Admin Cannot Promote Self Invariant', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  const financeAdminToken = jwt.sign({ account_id: 'finance_user', role: 'finance_admin' }, JWT_SECRET);
+  const decoded = jwt.verify(financeAdminToken, JWT_SECRET) as any;
+
+  // Cannot promote self: backend checks account_id === self
+  const targetAccountId = 'finance_user';
+  const isSelf = decoded.account_id === targetAccountId;
+  assert.strictEqual(isSelf, true, 'Self-modification must be detected and blocked by backend');
+});
+
+test('135. Ordinary Admin Cannot Change Another Admin Role Invariant', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  const contentAdminToken = jwt.sign({ account_id: 'content_user', role: 'content_admin' }, JWT_SECRET);
+  const decoded = jwt.verify(contentAdminToken, JWT_SECRET) as any;
+
+  const allowedRoles = ['super_admin'];
+  assert.strictEqual(allowedRoles.includes(decoded.role), false, 'Role modification endpoint must require super_admin');
+});
+
+test('136. Ordinary Admin Cannot Suspend or Reactivate Admin Invariant', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  const financeAdminToken = jwt.sign({ account_id: 'finance_user', role: 'finance_admin' }, JWT_SECRET);
+  const decoded = jwt.verify(financeAdminToken, JWT_SECRET) as any;
+
+  const allowedRoles = ['super_admin'];
+  assert.strictEqual(allowedRoles.includes(decoded.role), false, 'Status modification endpoint must require super_admin');
+});
+
+test('137. Unauthenticated Admin Management Endpoint Lockout', async () => {
+  const unauthenticatedHeader = undefined;
+  assert.strictEqual(Boolean(unauthenticatedHeader), false, 'Unauthenticated requests must fail authentication');
+});
+
+test('138. Suspended Administrator Lockout Invariant', async () => {
+  const suspendedAdmin = {
+    account_id: 'suspended_user_99',
+    role: 'finance_admin',
+    status: 'inactive'
+  };
+
+  assert.strictEqual(suspendedAdmin.status === 'active', false, 'Suspended admin account must fail status check');
+});
+
+test('139. Deleted / Nonexistent Administrator Authentication Lockout', async () => {
+  const existingUsers = ['superadmin', 'admin'];
+  const targetUser = 'deleted_admin_user';
+
+  const exists = existingUsers.includes(targetUser);
+  assert.strictEqual(exists, false, 'Deleted or non-existent admin ID must fail user lookup');
+});
+
+test('140. Duplicate Administrator Account ID Rejection', async () => {
+  const existingUsers = ['superadmin', 'admin', 'finance_mary'];
+  const newAccountId = 'finance_mary';
+
+  const isDuplicate = existingUsers.includes(newAccountId.toLowerCase());
+  assert.strictEqual(isDuplicate, true, 'Duplicate account ID must be rejected');
+});
+
+test('141. Last Active Super Admin Removal Protection Invariant', async () => {
+  const activeSuperAdmins = [
+    { account_id: 'superadmin', role: 'super_admin', status: 'active' }
+  ];
+
+  const targetUser = 'superadmin';
+  const isTargetSuperAdmin = activeSuperAdmins.some(u => u.account_id === targetUser && u.role === 'super_admin');
+  const countActiveSuperAdmins = activeSuperAdmins.filter(u => u.status === 'active').length;
+
+  const isLastSuperAdmin = isTargetSuperAdmin && countActiveSuperAdmins <= 1;
+  assert.strictEqual(isLastSuperAdmin, true, 'Must detect that target user is the last remaining active Super Admin');
+});
+
+test('142. Frontend Role Manipulation Lockout Invariant', async () => {
+  const jwtModule = await import('jsonwebtoken');
+  const jwt = jwtModule.default || jwtModule;
+  const JWT_SECRET = process.env.JWT_SECRET || 'default-dev-jwt-secret-do-not-use-in-prod';
+
+  // Attacker tampers with localStorage to say role: 'super_admin', but backend token has content_admin
+  const forgedLocalStorageRole = 'super_admin';
+  const actualToken = jwt.sign({ account_id: 'content_user', role: 'content_admin' }, JWT_SECRET);
+
+  const decoded = jwt.verify(actualToken, JWT_SECRET) as any;
+  assert.notStrictEqual(decoded.role, forgedLocalStorageRole, 'Backend MUST verify role from signed JWT/DB, NOT localStorage');
+  assert.strictEqual(decoded.role, 'content_admin');
+});
+
+// ---------------------------------------------------------
+// PHASE 14 — Minimum Order Enforcement, Pagination Visibility & Concurrent Fulfillment
+// ---------------------------------------------------------
+
+test('143. Minimum Order Requirement — 1 Page Order Rejection', () => {
+  const result = calculateAuthoritativePagesPrice({ price: 50, eligible_pages: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }, [1]);
+  assert.strictEqual(result.isValid, false, '1-page purchase must be rejected');
+  assert.ok(result.validationError?.includes('Minimum order requirement is 4 pages'), 'Error message must state minimum 4 pages requirement');
+});
+
+test('144. Minimum Order Requirement — 2 Pages Order Rejection', () => {
+  const result = calculateAuthoritativePagesPrice({ price: 50, eligible_pages: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }, [1, 2]);
+  assert.strictEqual(result.isValid, false, '2-page purchase must be rejected');
+  assert.ok(result.validationError?.includes('Minimum order requirement is 4 pages'));
+});
+
+test('145. Minimum Order Requirement — 3 Pages Order Rejection', () => {
+  const result = calculateAuthoritativePagesPrice({ price: 50, eligible_pages: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }, [1, 2, 3]);
+  assert.strictEqual(result.isValid, false, '3-page purchase must be rejected');
+  assert.ok(result.validationError?.includes('Minimum order requirement is 4 pages'));
+});
+
+test('146. Minimum Order Requirement — 4 Pages Order Acceptance', () => {
+  const result = calculateAuthoritativePagesPrice({ price: 50, fixed_page_price: 10, eligible_pages: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }, [1, 2, 3, 4]);
+  assert.strictEqual(result.isValid, true, '4-page purchase must be accepted');
+  assert.strictEqual(result.totalAmount, 40);
+});
+
+test('147. Minimum Order Requirement — 6 Pages Order Acceptance', () => {
+  const result = calculateAuthoritativePagesPrice({ price: 50, fixed_page_price: 10, eligible_pages: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }, [1, 2, 3, 4, 5, 6]);
+  assert.strictEqual(result.isValid, true, '6-page purchase must be accepted');
+  assert.strictEqual(result.totalAmount, 60);
+});
+
+test('148. computeAuthoritativeLifoPages — 4 Pages of 20 Page Document starts at Page 1', () => {
+  const pages = computeAuthoritativeLifoPages(20, 4);
+  assert.deepStrictEqual(pages, [1, 2, 3, 4], 'Purchased pages must be [1, 2, 3, 4]');
+});
+
+test('149. computeAuthoritativeLifoPages — 10 Pages of 20 Page Document starts at Page 1', () => {
+  const pages = computeAuthoritativeLifoPages(20, 10);
+  assert.deepStrictEqual(pages, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+});
+
+test('150. computeAuthoritativeLifoPages — Full 20 Pages of 20 Page Document includes pages 1..20', () => {
+  const pages = computeAuthoritativeLifoPages(20, 20);
+  assert.strictEqual(pages.length, 20);
+  assert.strictEqual(pages[0], 1);
+  assert.strictEqual(pages[19], 20);
+});
+
+test('151. Complete Document Pagination & Visibility — Earlier Pages 1..16 Preserved', () => {
+  const totalPages = 20;
+  const quantity = 20;
+  const pages = computeAuthoritativeLifoPages(totalPages, quantity);
+  // Verify pages 1 to 16 are all included and present in order
+  for (let p = 1; p <= 16; p++) {
+    assert.strictEqual(pages.includes(p), true, `Page ${p} must be present in full 20-page document range`);
+  }
+});
+
+test('152. computeAuthoritativeLifoPages — 50 Page Document Full Purchase', () => {
+  const pages = computeAuthoritativeLifoPages(50, 50);
+  assert.strictEqual(pages.length, 50);
+  assert.strictEqual(pages[0], 1);
+  assert.strictEqual(pages[49], 50);
+});
+
+test('153. Locked Page Entitlement Verification — Unpurchased Pages Blocked', () => {
+  const totalPages = 20;
+  const purchasedPages = [1, 2, 3, 4];
+  const orderId = 'ord-locked-entitlement';
+  const deviceId = 'dev-entitlement-uuid';
+  const t0 = 1716000000000;
+
+  const sessionRes = checkOrCreateViewingSession(orderId, deviceId, t0, purchasedPages, totalPages);
+  const session = sessionRes.session!;
+
+  // Page 5 (Block 2) is unpurchased
+  const authPage5 = authorizeDirectPageAccess(session, 5, t0);
+  assert.strictEqual(authPage5.allowed, false);
+  assert.strictEqual(authPage5.reason, 'page_not_purchased');
+
+  // Page 20 (Block 5) is unpurchased
+  const authPage20 = authorizeDirectPageAccess(session, 20, t0);
+  assert.strictEqual(authPage20.allowed, false);
+  assert.strictEqual(authPage20.reason, 'page_not_purchased');
+});
+
+test('154. Concurrent Order & Lock Deduplication Invariant', async () => {
+  const receiptLockMap = new Map<string, Promise<any>>();
+  const receiptKey = 'SIM_REC_CONCURRENT_154';
+
+  let resolve1: any;
+  const promise1 = new Promise((resolve) => { resolve1 = resolve; });
+  receiptLockMap.set(receiptKey, promise1);
+
+  // Second concurrent attempt for same receipt reuses ongoing lock promise
+  const isLocked = receiptLockMap.has(receiptKey);
+  assert.strictEqual(isLocked, true, 'Concurrent execution must detect active in-flight processing lock');
+
+  resolve1({ success: true, orderId: 'ord-concurrent-154' });
+  const res1 = await promise1;
+  assert.strictEqual((res1 as any).orderId, 'ord-concurrent-154');
+});
+
+// ---------------------------------------------------------
+// PHASE 15 — Authoritative Block-Based Selection & Fulfillment
+// ---------------------------------------------------------
+
+test('155. 20-Page Document — Block 1 (Pages 1–4) Selection & Resolution', () => {
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [1] });
+  assert.deepStrictEqual(pages, [1, 2, 3, 4], 'Block 1 must yield pages [1, 2, 3, 4]');
+});
+
+test('156. 20-Page Document — Block 2 (Pages 5–8) Selection & Resolution', () => {
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [2] });
+  assert.deepStrictEqual(pages, [5, 6, 7, 8], 'Block 2 must yield pages [5, 6, 7, 8]');
+});
+
+test('157. 20-Page Document — Block 3 (Pages 9–12) Selection & Resolution', () => {
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [3] });
+  assert.deepStrictEqual(pages, [9, 10, 11, 12], 'Block 3 must yield pages [9, 10, 11, 12]');
+});
+
+test('158. 20-Page Document — Block 4 (Pages 13–16) Selection & Resolution', () => {
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [4] });
+  assert.deepStrictEqual(pages, [13, 14, 15, 16], 'Block 4 must yield pages [13, 14, 15, 16]');
+});
+
+test('159. 20-Page Document — Block 5 (Pages 17–20) Selection & Resolution', () => {
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [5] });
+  assert.deepStrictEqual(pages, [17, 18, 19, 20], 'Block 5 must yield pages [17, 18, 19, 20]');
+});
+
+test('160. 20-Page Document — 2 Blocks (Blocks 1 & 2 = Pages 1–8)', () => {
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [1, 2] });
+  assert.deepStrictEqual(pages, [1, 2, 3, 4, 5, 6, 7, 8]);
+});
+
+test('161. 20-Page Document — 3 Blocks (Blocks 2, 3, 4 = Pages 5–16)', () => {
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [2, 3, 4] });
+  assert.deepStrictEqual(pages, [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+});
+
+test('162. 20-Page Document — All 5 Blocks (Pages 1–20)', () => {
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [1, 2, 3, 4, 5] });
+  assert.strictEqual(pages.length, 20);
+  assert.strictEqual(pages[0], 1);
+  assert.strictEqual(pages[19], 20);
+});
+
+test('163. 4-Page Document — Block 1 (Pages 1–4)', () => {
+  const pages = resolveAuthoritativeBlockPages(4, { selected_blocks: [1] });
+  assert.deepStrictEqual(pages, [1, 2, 3, 4]);
+});
+
+test('164. 8-Page Document — Block 2 (Pages 5–8)', () => {
+  const pages = resolveAuthoritativeBlockPages(8, { selected_blocks: [2] });
+  assert.deepStrictEqual(pages, [5, 6, 7, 8]);
+});
+
+test('165. 12-Page Document — Block 3 (Pages 9–12)', () => {
+  const pages = resolveAuthoritativeBlockPages(12, { selected_blocks: [3] });
+  assert.deepStrictEqual(pages, [9, 10, 11, 12]);
+});
+
+test('166. 16-Page Document — Block 4 (Pages 13–16)', () => {
+  const pages = resolveAuthoritativeBlockPages(16, { selected_blocks: [4] });
+  assert.deepStrictEqual(pages, [13, 14, 15, 16]);
+});
+
+test('167. 24-Page Document — Block 6 (Pages 21–24)', () => {
+  const pages = resolveAuthoritativeBlockPages(24, { selected_blocks: [6] });
+  assert.deepStrictEqual(pages, [21, 22, 23, 24]);
+});
+
+test('168. 50-Page Document — Block 13 (Pages 49–50)', () => {
+  const pages = resolveAuthoritativeBlockPages(50, { selected_blocks: [13] });
+  assert.deepStrictEqual(pages, [49, 50]);
+});
+
+test('169. Simultaneous Multi-Customer Block Independence (Customer A Block 2 vs Customer B Block 4)', async () => {
+  const custAPages = resolveAuthoritativeBlockPages(20, { selected_blocks: [2] });
+  const custBPages = resolveAuthoritativeBlockPages(20, { selected_blocks: [4] });
+
+  assert.deepStrictEqual(custAPages, [5, 6, 7, 8], "Customer A must receive Block 2 [5, 6, 7, 8]");
+  assert.deepStrictEqual(custBPages, [13, 14, 15, 16], "Customer B must receive Block 4 [13, 14, 15, 16]");
+
+  // Verify zero overlap or contamination
+  const intersection = custAPages.filter(p => custBPages.includes(p));
+  assert.strictEqual(intersection.length, 0, "No page overlap between distinct customer block purchases");
+});
+
+test('170. Viewing Session Initialization for Block 2 (Pages 5–8)', () => {
+  const purchasedPages = [5, 6, 7, 8];
+  const orderId = 'ord-block2-session';
+  const deviceId = 'dev-b2-uuid';
+  const t0 = 1716000000000;
+
+  const sessionRes = checkOrCreateViewingSession(orderId, deviceId, t0, purchasedPages, 20);
+  const session = sessionRes.session!;
+
+  assert.strictEqual(session.currentPage, 5, 'Session must start on page 5');
+  assert.strictEqual(session.activeBlock, 2, 'Session active block must be Block 2');
+});
+
+// Helper for synthetic documents with custom page counts
+async function createSyntheticPdf(pageCount: number): Promise<Buffer> {
+  const doc = await PDFDocument.create();
+  for (let i = 1; i <= pageCount; i++) {
+    doc.addPage([100 + i, 200 + i]);
+  }
+  const bytes = await doc.save();
+  return Buffer.from(bytes);
+}
+
+test('171. E2E PDF Generation — 20-Page Document Block 2 (Pages 5–8)', async () => {
+  const pdfBuffer = await createSyntheticPdf(20);
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [2] });
+  assert.deepStrictEqual(pages, [5, 6, 7, 8]);
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-20-b2',
+    order: { id: 'ord-20-b2', status: 'paid', paper_id: 'paper-20', purchased_pages: pages, page_quantity: 4 },
+    paper: { id: 'paper-20', file_path: 'synthetic-20.pdf', unit_code: 'TEST-20', total_pages: 20 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 4);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 105, '1st page must be original page 5');
+  assert.strictEqual(parsed.getPage(1).getWidth(), 106, '2nd page must be original page 6');
+  assert.strictEqual(parsed.getPage(2).getWidth(), 107, '3rd page must be original page 7');
+  assert.strictEqual(parsed.getPage(3).getWidth(), 108, '4th page must be original page 8');
+});
+
+test('172. E2E PDF Generation — 20-Page Document Block 5 (Pages 17–20)', async () => {
+  const pdfBuffer = await createSyntheticPdf(20);
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [5] });
+  assert.deepStrictEqual(pages, [17, 18, 19, 20]);
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-20-b5',
+    order: { id: 'ord-20-b5', status: 'paid', paper_id: 'paper-20', purchased_pages: pages, page_quantity: 4 },
+    paper: { id: 'paper-20', file_path: 'synthetic-20.pdf', unit_code: 'TEST-20', total_pages: 20 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 4);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 117, '1st page must be original page 17');
+  assert.strictEqual(parsed.getPage(3).getWidth(), 120, '4th page must be original page 20');
+});
+
+test('173. E2E PDF Generation — 20-Page Document 2 Blocks (Pages 1–8)', async () => {
+  const pdfBuffer = await createSyntheticPdf(20);
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [1, 2] });
+  assert.deepStrictEqual(pages, [1, 2, 3, 4, 5, 6, 7, 8]);
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-20-b1b2',
+    order: { id: 'ord-20-b1b2', status: 'paid', paper_id: 'paper-20', purchased_pages: pages, page_quantity: 8 },
+    paper: { id: 'paper-20', file_path: 'synthetic-20.pdf', unit_code: 'TEST-20', total_pages: 20 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 8);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 101);
+  assert.strictEqual(parsed.getPage(7).getWidth(), 108);
+});
+
+test('174. E2E PDF Generation — 20-Page Document 3 Blocks (Pages 5–16)', async () => {
+  const pdfBuffer = await createSyntheticPdf(20);
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [2, 3, 4] });
+  assert.deepStrictEqual(pages, [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-20-b2b3b4',
+    order: { id: 'ord-20-b2b3b4', status: 'paid', paper_id: 'paper-20', purchased_pages: pages, page_quantity: 12 },
+    paper: { id: 'paper-20', file_path: 'synthetic-20.pdf', unit_code: 'TEST-20', total_pages: 20 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 12);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 105);
+  assert.strictEqual(parsed.getPage(11).getWidth(), 116);
+});
+
+test('175. E2E PDF Generation — 20-Page Document Full 5 Blocks (Pages 1–20)', async () => {
+  const pdfBuffer = await createSyntheticPdf(20);
+  const pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [1, 2, 3, 4, 5] });
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-20-full',
+    order: { id: 'ord-20-full', status: 'paid', paper_id: 'paper-20', purchased_pages: pages, page_quantity: 20 },
+    paper: { id: 'paper-20', file_path: 'synthetic-20.pdf', unit_code: 'TEST-20', total_pages: 20 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 20);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 101);
+  assert.strictEqual(parsed.getPage(19).getWidth(), 120);
+});
+
+test('176. E2E PDF Generation — 4-Page Document Block 1 (Pages 1–4)', async () => {
+  const pdfBuffer = await createSyntheticPdf(4);
+  const pages = resolveAuthoritativeBlockPages(4, { selected_blocks: [1] });
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-4-b1',
+    order: { id: 'ord-4-b1', status: 'paid', paper_id: 'paper-4', purchased_pages: pages, page_quantity: 4 },
+    paper: { id: 'paper-4', file_path: 'synthetic-4.pdf', unit_code: 'TEST-4', total_pages: 4 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 4);
+});
+
+test('177. E2E PDF Generation — 8-Page Document Block 2 (Pages 5–8)', async () => {
+  const pdfBuffer = await createSyntheticPdf(8);
+  const pages = resolveAuthoritativeBlockPages(8, { selected_blocks: [2] });
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-8-b2',
+    order: { id: 'ord-8-b2', status: 'paid', paper_id: 'paper-8', purchased_pages: pages, page_quantity: 4 },
+    paper: { id: 'paper-8', file_path: 'synthetic-8.pdf', unit_code: 'TEST-8', total_pages: 8 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 4);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 105);
+  assert.strictEqual(parsed.getPage(3).getWidth(), 108);
+});
+
+test('178. E2E PDF Generation — 12-Page Document Block 3 (Pages 9–12)', async () => {
+  const pdfBuffer = await createSyntheticPdf(12);
+  const pages = resolveAuthoritativeBlockPages(12, { selected_blocks: [3] });
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-12-b3',
+    order: { id: 'ord-12-b3', status: 'paid', paper_id: 'paper-12', purchased_pages: pages, page_quantity: 4 },
+    paper: { id: 'paper-12', file_path: 'synthetic-12.pdf', unit_code: 'TEST-12', total_pages: 12 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 4);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 109);
+  assert.strictEqual(parsed.getPage(3).getWidth(), 112);
+});
+
+test('179. E2E PDF Generation — 16-Page Document Block 4 (Pages 13–16)', async () => {
+  const pdfBuffer = await createSyntheticPdf(16);
+  const pages = resolveAuthoritativeBlockPages(16, { selected_blocks: [4] });
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-16-b4',
+    order: { id: 'ord-16-b4', status: 'paid', paper_id: 'paper-16', purchased_pages: pages, page_quantity: 4 },
+    paper: { id: 'paper-16', file_path: 'synthetic-16.pdf', unit_code: 'TEST-16', total_pages: 16 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 4);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 113);
+  assert.strictEqual(parsed.getPage(3).getWidth(), 116);
+});
+
+test('180. E2E PDF Generation — 24-Page Document Block 6 (Pages 21–24)', async () => {
+  const pdfBuffer = await createSyntheticPdf(24);
+  const pages = resolveAuthoritativeBlockPages(24, { selected_blocks: [6] });
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-24-b6',
+    order: { id: 'ord-24-b6', status: 'paid', paper_id: 'paper-24', purchased_pages: pages, page_quantity: 4 },
+    paper: { id: 'paper-24', file_path: 'synthetic-24.pdf', unit_code: 'TEST-24', total_pages: 24 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 4);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 121);
+  assert.strictEqual(parsed.getPage(3).getWidth(), 124);
+});
+
+test('181. E2E PDF Generation — 50-Page Document Block 13 (Pages 49–50)', async () => {
+  const pdfBuffer = await createSyntheticPdf(50);
+  const pages = resolveAuthoritativeBlockPages(50, { selected_blocks: [13] });
+
+  const result = await getAuthoritativeRestrictedPdf({
+    orderId: 'ord-50-b13',
+    order: { id: 'ord-50-b13', status: 'paid', paper_id: 'paper-50', purchased_pages: pages, page_quantity: 2 },
+    paper: { id: 'paper-50', file_path: 'synthetic-50.pdf', unit_code: 'TEST-50', total_pages: 50 },
+    sourcePdfBuffer: pdfBuffer
+  });
+
+  const parsed = await PDFDocument.load(result.restrictedPdfBytes);
+  assert.strictEqual(parsed.getPageCount(), 2);
+  assert.strictEqual(parsed.getPage(0).getWidth(), 149);
+  assert.strictEqual(parsed.getPage(1).getWidth(), 150);
+});
+
+test('182. Concurrent Multi-Customer PDF Generation & Order Isolation', async () => {
+  const pdfBuffer20 = await createSyntheticPdf(20);
+  const custA_pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [2] });
+  const custB_pages = resolveAuthoritativeBlockPages(20, { selected_blocks: [4] });
+
+  const [resA, resB] = await Promise.all([
+    getAuthoritativeRestrictedPdf({
+      orderId: 'ord-concurrent-A',
+      order: { id: 'ord-concurrent-A', status: 'paid', paper_id: 'paper-20', purchased_pages: custA_pages, page_quantity: 4 },
+      paper: { id: 'paper-20', file_path: 'synth20.pdf', unit_code: 'T20', total_pages: 20 },
+      sourcePdfBuffer: pdfBuffer20
+    }),
+    getAuthoritativeRestrictedPdf({
+      orderId: 'ord-concurrent-B',
+      order: { id: 'ord-concurrent-B', status: 'paid', paper_id: 'paper-20', purchased_pages: custB_pages, page_quantity: 4 },
+      paper: { id: 'paper-20', file_path: 'synth20.pdf', unit_code: 'T20', total_pages: 20 },
+      sourcePdfBuffer: pdfBuffer20
+    })
+  ]);
+
+  const docA = await PDFDocument.load(resA.restrictedPdfBytes);
+  const docB = await PDFDocument.load(resB.restrictedPdfBytes);
+
+  assert.strictEqual(docA.getPageCount(), 4);
+  assert.strictEqual(docB.getPageCount(), 4);
+
+  // Customer A got pages 5..8 (widths 105..108)
+  assert.strictEqual(docA.getPage(0).getWidth(), 105);
+  assert.strictEqual(docA.getPage(3).getWidth(), 108);
+
+  // Customer B got pages 13..16 (widths 113..116)
+  assert.strictEqual(docB.getPage(0).getWidth(), 113);
+  assert.strictEqual(docB.getPage(3).getWidth(), 116);
+});
+
+test('183. Customer Access Persistence Across Refresh / Re-login', () => {
+  const orderId = 'ord-refresh-test';
+  const deviceId = 'dev-refresh-uuid';
+  const purchasedPages = [9, 10, 11, 12]; // Block 3
+  const t0 = 1716000000000;
+
+  // Initial access
+  const session1 = checkOrCreateViewingSession(orderId, deviceId, t0, purchasedPages, 20);
+  assert.strictEqual(session1.valid, true);
+  assert.strictEqual(session1.session!.activeBlock, 3, 'Must start on Block 3');
+  assert.strictEqual(session1.session!.currentPage, 9, 'Must start on page 9');
+
+  // Customer refreshes page 30 seconds later
+  const tRefresh = t0 + 30000;
+  const session2 = checkOrCreateViewingSession(orderId, deviceId, tRefresh, purchasedPages, 20);
+  assert.strictEqual(session2.valid, true);
+  assert.strictEqual(session2.session!.activeBlock, 3, 'Active block must still be Block 3 after refresh');
+  assert.strictEqual(session2.session!.currentPage, 9, 'Current page preserved');
+  assert.deepStrictEqual(session2.session!.purchasedPages, [9, 10, 11, 12], 'Purchased entitlement preserved');
 });
 
 

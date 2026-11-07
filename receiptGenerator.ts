@@ -22,20 +22,31 @@ function getSupabaseClient(): any {
     throw new Error('Supabase client not initialized in receipt generator');
 }
 
+const activeReceiptPromises = new Map<string, Promise<boolean>>();
+
 export async function generateAndMergeReceipt(orderId: string): Promise<boolean> {
-    try {
-        console.log(`[RECEIPT] Starting receipt generation for order ${orderId}...`);
-        const client = getSupabaseClient();
-        
-        // 1. Check if already generated
-        const mergedPath = `merged/${orderId}.pdf`;
-        const { data: existing } = await client.storage.from("Papers").list('merged', {
-            search: `${orderId}.pdf`
-        });
-        if (existing && existing.length > 0 && existing[0].name === `${orderId}.pdf`) {
-            console.log(`[RECEIPT] Merged PDF already exists for order ${orderId}. Skipping.`);
-            return true;
-        }
+    if (!orderId) return false;
+    
+    // Concurrency protection: Deduplicate parallel generation calls for the same orderId
+    if (activeReceiptPromises.has(orderId)) {
+        console.log(`[RECEIPT] Receipt generation already in progress for order ${orderId}. Awaiting active generation...`);
+        return activeReceiptPromises.get(orderId)!;
+    }
+
+    const promise = (async () => {
+        try {
+            console.log(`[RECEIPT] Starting receipt generation for order ${orderId}...`);
+            const client = getSupabaseClient();
+            
+            // 1. Check if already generated and verify receipt file size is valid (>100 bytes)
+            const mergedPath = `merged/${orderId}.pdf`;
+            const { data: existing } = await client.storage.from("Papers").list('merged', {
+                search: `${orderId}.pdf`
+            });
+            if (existing && existing.length > 0 && existing[0].name === `${orderId}.pdf` && ((existing[0].metadata?.size ?? 1000) > 100)) {
+                console.log(`[RECEIPT] Merged PDF already exists and verified for order ${orderId}. Skipping.`);
+                return true;
+            }
 
         // 2. Fetch required data sequentially to avoid Supabase join issues
         const { data: order, error: orderErr } = await client
@@ -156,5 +167,11 @@ export async function generateAndMergeReceipt(orderId: string): Promise<boolean>
     } catch (err) {
         console.error(`[RECEIPT] Unexpected error during generation for order ${orderId}:`, err);
         return false;
+    } finally {
+        activeReceiptPromises.delete(orderId);
     }
+  })();
+
+  activeReceiptPromises.set(orderId, promise);
+  return promise;
 }
