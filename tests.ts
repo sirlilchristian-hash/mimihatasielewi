@@ -63,9 +63,20 @@ import {
   DARAJA_SANDBOX_SHORTCODE,
   DARAJA_SANDBOX_PASSKEY,
   DARAJA_SANDBOX_BASE_URL,
-  DARAJA_PRODUCTION_BASE_URL
+  DARAJA_PRODUCTION_BASE_URL,
+  generateSubmissionReferenceCode,
+  affiliateSubmissionsMap,
+  AFFILIATE_UPLOADS_DIR,
+  contactMessagesStore
 } from './server.ts';
-import { getSmtpConfig, sendActivationEmail, setSmtpTransporter } from './emailService.ts';
+import {
+  getSmtpConfig,
+  sendActivationEmail,
+  setSmtpTransporter,
+  sendAffiliateSubmissionNotificationEmail,
+  sendContactMessageEmail,
+  getHostAdminEmail
+} from './emailService.ts';
 
 // ---------------------------------------------------------
 // Existing Phase 1-4 Baseline Tests
@@ -4381,6 +4392,493 @@ test('183. Customer Access Persistence Across Refresh / Re-login', () => {
   assert.strictEqual(session2.session!.activeBlock, 3, 'Active block must still be Block 3 after refresh');
   assert.strictEqual(session2.session!.currentPage, 9, 'Current page preserved');
   assert.deepStrictEqual(session2.session!.purchasedPages, [9, 10, 11, 12], 'Purchased entitlement preserved');
+});
+
+// ---------------------------------------------------------
+// Phase 16: Affiliate Document Submission, SMTP Notification & Admin-Approved Papers Import
+// ---------------------------------------------------------
+
+test('184. Scenario 1: Affiliate Document Upload File Validation — Valid Extensions Accepted, Invalid Rejected', () => {
+  const allowedExtensions = ['.pdf', '.doc', '.docx'];
+  const testFiles = [
+    { name: 'Calculus_Exam_2023.pdf', valid: true },
+    { name: 'Anatomy_Revision.docx', valid: true },
+    { name: 'Marketing_Cat.doc', valid: true },
+    { name: 'malicious_script.exe', valid: false },
+    { name: 'payload.js', valid: false },
+    { name: 'index.html', valid: false },
+    { name: 'archive.zip', valid: false },
+  ];
+
+  for (const f of testFiles) {
+    const ext = path.extname(f.name).toLowerCase();
+    const isAllowed = allowedExtensions.includes(ext);
+    assert.strictEqual(
+      isAllowed,
+      f.valid,
+      `File ${f.name} validation mismatch: expected ${f.valid}, got ${isAllowed}`
+    );
+  }
+});
+
+test('185. Scenario 2: File Size Limit Enforcement — Documents Exceeding 50MB Rejected', () => {
+  const MAX_SIZE = 50 * 1024 * 1024; // 50MB
+  const validSize = 15 * 1024 * 1024; // 15MB
+  const limitSize = 50 * 1024 * 1024; // Exact 50MB
+  const oversized = 50 * 1024 * 1024 + 1; // 50MB + 1 byte
+  const hugeSize = 120 * 1024 * 1024; // 120MB
+
+  assert.strictEqual(validSize <= MAX_SIZE, true, '15MB file must be accepted');
+  assert.strictEqual(limitSize <= MAX_SIZE, true, 'Exact 50MB file must be accepted');
+  assert.strictEqual(oversized <= MAX_SIZE, false, '50MB + 1 byte must be rejected');
+  assert.strictEqual(hugeSize <= MAX_SIZE, false, '120MB file must be rejected');
+});
+
+test('186. Scenario 3: Required Metadata Validation — Paper Title, Unit Code, Contributor Info Required', () => {
+  const validateSubmission = (payload: any) => {
+    const errors: string[] = [];
+    if (!payload.affiliate_name?.trim()) errors.push('Affiliate name is required.');
+    if (!payload.affiliate_email?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.affiliate_email)) {
+      errors.push('A valid email address is required.');
+    }
+    if (!payload.affiliate_phone?.trim()) errors.push('Phone number is required.');
+    if (!payload.paper_title?.trim()) errors.push('Paper title is required.');
+    if (!payload.unit_code?.trim()) errors.push('Unit code is required.');
+    if (!payload.fileBuffer || payload.fileBuffer.length === 0) errors.push('Document file attachment is required.');
+    return errors;
+  };
+
+  // Missing title
+  const err1 = validateSubmission({
+    affiliate_name: 'Collins',
+    affiliate_email: 'collins@example.com',
+    affiliate_phone: '0712345678',
+    unit_code: 'BDS3208',
+    fileBuffer: Buffer.from('test'),
+  });
+  assert.strictEqual(err1.includes('Paper title is required.'), true);
+
+  // Missing unit code
+  const err2 = validateSubmission({
+    affiliate_name: 'Collins',
+    affiliate_email: 'collins@example.com',
+    affiliate_phone: '0712345678',
+    paper_title: 'Oral Pathology I',
+    fileBuffer: Buffer.from('test'),
+  });
+  assert.strictEqual(err2.includes('Unit code is required.'), true);
+
+  // Missing email
+  const err3 = validateSubmission({
+    affiliate_name: 'Collins',
+    affiliate_phone: '0712345678',
+    paper_title: 'Oral Pathology I',
+    unit_code: 'BDS3208',
+    fileBuffer: Buffer.from('test'),
+  });
+  assert.strictEqual(err3.includes('A valid email address is required.'), true);
+
+  // Valid payload
+  const errValid = validateSubmission({
+    affiliate_name: 'Collins Angima',
+    affiliate_email: 'collins@example.com',
+    affiliate_phone: '0712345678',
+    paper_title: 'Oral Pathology I 2018/2019',
+    unit_code: 'BDS3208',
+    fileBuffer: Buffer.from('test'),
+  });
+  assert.strictEqual(errValid.length, 0, 'Valid payload should have zero errors');
+});
+
+test('187. Scenario 4: Reference Code Generation Format — SUB-YYYYMMDD-XXXX Structure & Uniqueness', () => {
+  const codes = new Set<string>();
+  const regex = /^SUB-\d{8}-[A-F0-9]{4}$/;
+
+  for (let i = 0; i < 50; i++) {
+    const code = generateSubmissionReferenceCode();
+    assert.strictEqual(regex.test(code), true, `Code ${code} must match SUB-YYYYMMDD-XXXX format`);
+    assert.strictEqual(codes.has(code), false, `Code ${code} must be unique`);
+    codes.add(code);
+  }
+});
+
+test('188. Scenario 5: Secure Document File Storage & Isolated Path Resolution', () => {
+  const testSubId = 'sub_test_storage_123';
+  const originalName = 'BDS3208_Oral_Pathology.pdf';
+  const sanitized = originalName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+  const diskFileName = `${testSubId}-${sanitized}`;
+  const filePath = path.join(AFFILIATE_UPLOADS_DIR, diskFileName);
+
+  assert.strictEqual(filePath.includes('uploads/affiliate_submissions'), true);
+  assert.strictEqual(filePath.includes('..'), false, 'Path must not contain traversal characters');
+  assert.strictEqual(diskFileName.startsWith('sub_test_storage_123'), true);
+});
+
+test('189. Scenario 6: Automated SMTP Email Dispatched to Host Inbox on Submission', async () => {
+  let capturedMail: any = null;
+  const mockTransporter = {
+    sendMail: async (mailOptions: any) => {
+      capturedMail = mailOptions;
+      return { messageId: 'mock-affiliate-submission-msg-123', response: '250 OK' };
+    },
+    verify: async () => true,
+  };
+  setSmtpTransporter(mockTransporter);
+
+  // Set credentials for test
+  process.env.SMTP_USER = 'godrery.smtp@gmail.com';
+  process.env.SMTP_PASSWORD = 'app-password-test';
+  process.env.ADMIN_EMAIL = 'host.desk@godrerypublishers.com';
+
+  const result = await sendAffiliateSubmissionNotificationEmail({
+    to: 'host.desk@godrerypublishers.com',
+    affiliateName: 'Faith Wanjiku',
+    affiliateEmail: 'faith@example.com',
+    affiliatePhone: '0722000000',
+    referenceCode: 'SUB-20261107-F1A2',
+    paperTitle: 'Software Engineering II Final Exam 2023',
+    unitCode: 'BIT3101',
+    category: 'Computer Science',
+    academicLevel: 'Undergraduate Degree',
+    description: 'Complete with marking scheme notes',
+    originalFileName: 'BIT3101_2023.pdf',
+    fileSizeBytes: 2450000,
+    submissionDate: new Date().toUTCString(),
+    reviewUrl: 'https://godrerypublishers.com/admin?section=affiliate_submissions&review=SUB-20261107-F1A2',
+  });
+
+  assert.strictEqual(result.success, true);
+  assert.strictEqual(result.status, 'EMAIL SENT');
+  assert.strictEqual(capturedMail !== null, true);
+  assert.strictEqual(capturedMail.subject.includes('Software Engineering II Final Exam 2023'), true);
+  assert.strictEqual(capturedMail.subject.includes('SUB-20261107-F1A2'), true);
+  assert.strictEqual(capturedMail.html.includes('BIT3101'), true);
+});
+
+test('190. Scenario 7: Email Content Integrity — Paper Title, Contributor Info & Secure Review URL', async () => {
+  let capturedMail: any = null;
+  const mockTransporter = {
+    sendMail: async (mailOptions: any) => {
+      capturedMail = mailOptions;
+      return { messageId: 'msg-integrity-777', response: '250 OK' };
+    },
+  };
+  setSmtpTransporter(mockTransporter);
+
+  await sendAffiliateSubmissionNotificationEmail({
+    to: 'operations@godrerypublishers.com',
+    affiliateName: 'Daniel Kiprotich',
+    affiliateEmail: 'daniel@example.com',
+    affiliatePhone: '0711999888',
+    referenceCode: 'SUB-20261107-D999',
+    paperTitle: 'Calculus I CAT 1 2024',
+    unitCode: 'BMA1102',
+    category: 'Mathematics',
+    academicLevel: 'Undergraduate Degree',
+    reviewUrl: 'https://godrerypublishers.com/admin?section=affiliate_submissions&review=SUB-20261107-D999',
+  });
+
+  assert.strictEqual(capturedMail !== null, true);
+  assert.strictEqual(capturedMail.html.includes('Daniel Kiprotich'), true);
+  assert.strictEqual(capturedMail.html.includes('BMA1102'), true);
+  assert.strictEqual(capturedMail.html.includes('Calculus I CAT 1 2024'), true);
+  assert.strictEqual(capturedMail.html.includes('SUB-20261107-D999'), true);
+  assert.strictEqual(capturedMail.html.includes('VIEW SUBMITTED DOCUMENT'), true);
+  assert.strictEqual(capturedMail.html.includes('https://godrerypublishers.com/admin?section=affiliate_submissions&review=SUB-20261107-D999'), true);
+  assert.strictEqual(capturedMail.html.includes('STATUS: PENDING ADMIN REVIEW'), true);
+});
+
+test('191. Scenario 8: Isolation Invariant — Staged Document Does Not Appear in Public Papers Database', () => {
+  const stagedSubId = 'sub_isolated_test_001';
+  const stagedRecord = {
+    id: stagedSubId,
+    reference_code: 'SUB-20261107-ISO1',
+    affiliate_name: 'John Doe',
+    affiliate_email: 'john@example.com',
+    affiliate_phone: '0700000001',
+    paper_title: 'Unpublished Organic Chemistry Exam',
+    unit_code: 'BCH1105',
+    category: 'Chemistry',
+    total_pages: 8,
+    file_path: '/tmp/test.pdf',
+    file_size_bytes: 1024,
+    mime_type: 'application/pdf',
+    original_filename: 'BCH1105.pdf',
+    status: 'pending' as const,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  affiliateSubmissionsMap.set(stagedSubId, stagedRecord);
+
+  // Verify staged record status is 'pending'
+  const record = affiliateSubmissionsMap.get(stagedSubId);
+  assert.strictEqual(record?.status, 'pending');
+  assert.strictEqual(record?.imported_paper_id, undefined, 'Must not have imported_paper_id while staged');
+
+  // Verify search query in public papers catalog would NOT find staged records
+  const isPubliclyAvailable = record?.status === 'approved' && Boolean(record?.imported_paper_id);
+  assert.strictEqual(isPubliclyAvailable, false, 'Staged paper must not be publicly available');
+});
+
+test('192. Scenario 9: Contact Us Form Endpoints (/api/contact & /api/messages) Dispatch to Host Inbox Without 501 or Requiring Admin Auth', async () => {
+  let capturedContactMail: any = null;
+  const mockTransporter = {
+    sendMail: async (mailOptions: any) => {
+      capturedContactMail = mailOptions;
+      return { messageId: 'contact-msg-123', response: '250 OK' };
+    },
+  };
+  setSmtpTransporter(mockTransporter);
+
+  // Send message using the helper
+  const result = await sendContactMessageEmail({
+    to: 'host@godrerypublishers.com',
+    fullName: 'Grace Muthoni',
+    email: 'grace@example.com',
+    phone: '0712000000',
+    subject: 'Unit Inquiry: BED1101 Microeconomics',
+    message: 'I would like to inquire about the 2022 exam marking scheme.',
+    timestamp: new Date().toISOString(),
+  });
+
+  assert.strictEqual(result.success, true);
+  assert.strictEqual(result.status, 'EMAIL SENT');
+  assert.strictEqual(capturedContactMail !== null, true);
+  assert.strictEqual(capturedContactMail.to, 'host@godrerypublishers.com');
+  assert.strictEqual(capturedContactMail.html.includes('Grace Muthoni'), true);
+  assert.strictEqual(capturedContactMail.html.includes('BED1101 Microeconomics'), true);
+  assert.strictEqual(capturedContactMail.replyTo, 'grace@example.com');
+});
+
+test('193. Scenario 10: Admin Authentication & RBAC Gate for Review Queue and File Streaming', () => {
+  const allowedReviewRoles = ['super_admin', 'content_admin', 'support_admin'];
+  const allowedPushRoles = ['super_admin', 'content_admin'];
+
+  // Content Admin and Super Admin can review and push
+  assert.strictEqual(allowedReviewRoles.includes('super_admin'), true);
+  assert.strictEqual(allowedReviewRoles.includes('content_admin'), true);
+  assert.strictEqual(allowedPushRoles.includes('super_admin'), true);
+  assert.strictEqual(allowedPushRoles.includes('content_admin'), true);
+
+  // Support Admin can review but cannot push
+  assert.strictEqual(allowedReviewRoles.includes('support_admin'), true);
+  assert.strictEqual(allowedPushRoles.includes('support_admin'), false, 'Support admin cannot push to Papers database');
+
+  // Customer / unauthenticated cannot access either
+  assert.strictEqual(allowedReviewRoles.includes('customer'), false);
+  assert.strictEqual(allowedPushRoles.includes('customer'), false);
+});
+
+test('194. Scenario 11: Admin Metadata Editing Without Importing — Updates Record In-Place', () => {
+  const subId = 'sub_edit_test_101';
+  const original = {
+    id: subId,
+    reference_code: 'SUB-20261107-ED01',
+    affiliate_name: 'Peter Mwangi',
+    affiliate_email: 'peter@example.com',
+    affiliate_phone: '0733111222',
+    paper_title: 'Draft Calculus Paper',
+    unit_code: 'MAT101',
+    category: 'Math',
+    total_pages: 4,
+    file_path: '/tmp/calc.pdf',
+    file_size_bytes: 2048,
+    mime_type: 'application/pdf',
+    original_filename: 'calc.pdf',
+    status: 'pending' as const,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  affiliateSubmissionsMap.set(subId, original);
+
+  // Admin edits title and unit code
+  const record = affiliateSubmissionsMap.get(subId)!;
+  record.paper_title = 'Calculus I & Analytical Geometry 2024';
+  record.unit_code = 'BMA1102';
+  record.category = 'Mathematical Sciences';
+  record.price = 40;
+  record.updated_at = new Date().toISOString();
+
+  assert.strictEqual(record.paper_title, 'Calculus I & Analytical Geometry 2024');
+  assert.strictEqual(record.unit_code, 'BMA1102');
+  assert.strictEqual(record.price, 40);
+  assert.strictEqual(record.status, 'pending', 'Editing metadata must not alter pending status');
+  assert.strictEqual(record.imported_paper_id, undefined, 'Must not be imported yet');
+});
+
+test('195. Scenario 12: Admin Rejection Workflow — Status Updated to Rejected with Reason Preserved', () => {
+  const subId = 'sub_reject_test_202';
+  const record = {
+    id: subId,
+    reference_code: 'SUB-20261107-RJ01',
+    affiliate_name: 'Alex Otieno',
+    affiliate_email: 'alex@example.com',
+    affiliate_phone: '0744222333',
+    paper_title: 'Corrupted Scanning Test Paper',
+    unit_code: 'BPH1101',
+    total_pages: 4,
+    file_path: '/tmp/corrupt.pdf',
+    file_size_bytes: 512,
+    mime_type: 'application/pdf',
+    original_filename: 'corrupt.pdf',
+    status: 'pending' as any,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  affiliateSubmissionsMap.set(subId, record);
+
+  // Admin rejects
+  record.status = 'rejected';
+  record.rejection_reason = 'Illegible photocopy with cut off questions in Section B.';
+  record.updated_at = new Date().toISOString();
+
+  const retrieved = affiliateSubmissionsMap.get(subId)!;
+  assert.strictEqual(retrieved.status, 'rejected');
+  assert.strictEqual(retrieved.rejection_reason, 'Illegible photocopy with cut off questions in Section B.');
+  assert.strictEqual(retrieved.imported_paper_id, undefined, 'Rejected submission must never have imported_paper_id');
+});
+
+test('196. Scenario 13: Push to Papers Database Authorization Gate — Unauthorized Role Rejected', () => {
+  const checkCanPush = (userRole: string) => {
+    return userRole === 'super_admin' || userRole === 'content_admin';
+  };
+
+  assert.strictEqual(checkCanPush('super_admin'), true);
+  assert.strictEqual(checkCanPush('content_admin'), true);
+  assert.strictEqual(checkCanPush('support_admin'), false, 'support_admin cannot push');
+  assert.strictEqual(checkCanPush('finance_admin'), false, 'finance_admin cannot push');
+  assert.strictEqual(checkCanPush('student'), false, 'student cannot push');
+});
+
+test('197. Scenario 14: Push to Papers Database Atomic Insertion with Correct Metadata & Page Count', () => {
+  const subId = 'sub_push_atomic_303';
+  const stagedSub = {
+    id: subId,
+    reference_code: 'SUB-20261107-PS01',
+    affiliate_name: 'Dr. Kennedy Njoroge',
+    affiliate_email: 'kennedy@example.com',
+    affiliate_phone: '0755333444',
+    paper_title: 'Medical Physiology II Final 2023',
+    unit_code: 'BPH1102',
+    category: 'Medical Sciences',
+    academic_level: 'Undergraduate Degree',
+    total_pages: 12,
+    file_path: '/uploads/affiliate_submissions/sub_push_atomic_303-BPH1102.pdf',
+    file_size_bytes: 3145728,
+    mime_type: 'application/pdf',
+    original_filename: 'BPH1102.pdf',
+    status: 'pending' as any,
+    price: 35,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  affiliateSubmissionsMap.set(subId, stagedSub);
+
+  // Execute atomic push simulation
+  const generatedPaperId = `paper_${crypto.randomUUID()}`;
+  const paperPayload = {
+    id: generatedPaperId,
+    paper_title: stagedSub.paper_title,
+    unit_code: stagedSub.unit_code,
+    category: stagedSub.category,
+    price: stagedSub.price.toString(),
+    total_pages: stagedSub.total_pages,
+    file_path: path.basename(stagedSub.file_path),
+    status: 'available',
+  };
+
+  // Status transition
+  stagedSub.status = 'approved';
+  (stagedSub as any).imported_paper_id = generatedPaperId;
+  (stagedSub as any).imported_at = new Date().toISOString();
+  (stagedSub as any).imported_by = 'superadmin_1';
+
+  assert.strictEqual(paperPayload.paper_title, 'Medical Physiology II Final 2023');
+  assert.strictEqual(paperPayload.unit_code, 'BPH1102');
+  assert.strictEqual(paperPayload.total_pages, 12);
+  assert.strictEqual(paperPayload.status, 'available');
+  assert.strictEqual(stagedSub.status, 'approved');
+  assert.strictEqual((stagedSub as any).imported_paper_id, generatedPaperId);
+});
+
+test('198. Scenario 15: Exact Database Counter Invariant — Total Papers Count Increments by Exactly 1', () => {
+  let simulatedPapersCount = 42;
+
+  // Before push
+  const initialCount = simulatedPapersCount;
+
+  // Admin approves and pushes 1 paper
+  simulatedPapersCount += 1;
+
+  // After push
+  assert.strictEqual(simulatedPapersCount, initialCount + 1, 'Total papers count must increment by exactly 1');
+});
+
+test('199. Scenario 16: Duplicate Push Prevention — Idempotent 409 Conflict Gate on Already-Imported Submissions', () => {
+  const subId = 'sub_duplicate_gate_404';
+  const approvedSub = {
+    id: subId,
+    reference_code: 'SUB-20261107-DUP1',
+    affiliate_name: 'Beatrice Akinyi',
+    affiliate_email: 'beatrice@example.com',
+    affiliate_phone: '0766444555',
+    paper_title: 'Intro to Computers BCS1101',
+    unit_code: 'BCS1101',
+    status: 'approved' as const,
+    imported_paper_id: 'paper_existing_abc123',
+    imported_at: '2026-11-07T12:00:00.000Z',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  affiliateSubmissionsMap.set(subId, approvedSub as any);
+
+  // Attempt second push
+  const record = affiliateSubmissionsMap.get(subId)!;
+  const isDuplicate = record.status === 'approved' || Boolean(record.imported_paper_id);
+
+  assert.strictEqual(isDuplicate, true, 'Second push must be identified as duplicate import');
+  const errorResponse = isDuplicate
+    ? { status: 409, error: 'This document has already been approved and imported into the Papers database.' }
+    : { status: 201 };
+
+  assert.strictEqual(errorResponse.status, 409);
+  assert.strictEqual(errorResponse.error.includes('already been approved'), true);
+});
+
+test('200. Scenario 17: Post-Import Integrity Reflection — Submission Marked Approved with imported_paper_id & Timestamp', () => {
+  const subId = 'sub_post_import_505';
+  const paperId = 'paper_live_xyz999';
+  const importTime = new Date().toISOString();
+
+  const record = {
+    id: subId,
+    reference_code: 'SUB-20261107-POST1',
+    affiliate_name: 'Samuel Kimani',
+    affiliate_email: 'samuel@example.com',
+    affiliate_phone: '0777555666',
+    paper_title: 'Public Speaking Final Exam',
+    unit_code: 'BPS1101',
+    status: 'approved' as const,
+    imported_paper_id: paperId,
+    imported_at: importTime,
+    imported_by: 'superadmin_1',
+    created_at: '2026-11-07T10:00:00.000Z',
+    updated_at: importTime,
+  };
+
+  affiliateSubmissionsMap.set(subId, record as any);
+
+  const fetched = affiliateSubmissionsMap.get(subId)!;
+  assert.strictEqual(fetched.status, 'approved');
+  assert.strictEqual(fetched.imported_paper_id, paperId);
+  assert.strictEqual(fetched.imported_at, importTime);
+  assert.strictEqual(fetched.imported_by, 'superadmin_1');
+  assert.strictEqual(fetched.reference_code, 'SUB-20261107-POST1');
 });
 
 

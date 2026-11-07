@@ -12,6 +12,7 @@ export type AdminSection =
   | 'orders'
   | 'payments'
   | 'papers'
+  | 'affiliate_submissions'
   | 'paper_sellers'
   | 'customers'
   | 'document_access'
@@ -20,6 +21,33 @@ export type AdminSection =
   | 'add_admin'
   | 'settings'
   | 'system_status';
+
+export interface AffiliateSubmissionAdminRecord {
+  id: string;
+  reference_code: string;
+  affiliate_name: string;
+  affiliate_email: string;
+  affiliate_phone: string;
+  affiliate_university?: string;
+  paper_title: string;
+  unit_code: string;
+  category?: string;
+  academic_level?: string;
+  description?: string;
+  price?: number;
+  original_filename: string;
+  file_path: string;
+  file_size_bytes: number;
+  mime_type: string;
+  total_pages: number;
+  status: 'pending' | 'under_review' | 'approved' | 'rejected';
+  rejection_reason?: string;
+  imported_paper_id?: string;
+  imported_at?: string;
+  imported_by?: string;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface TransactionRecord {
   id: string;

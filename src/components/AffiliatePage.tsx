@@ -18,7 +18,11 @@ import {
   Users,
   Info,
   ExternalLink,
-  UploadCloud
+  UploadCloud,
+  Copy,
+  Check,
+  AlertCircle,
+  Clock,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import affiliateBg from '../assets/images/affiliate_hero_bg_1789202174941.jpg';
@@ -43,7 +47,31 @@ const sampleMkuUnits = [
 ];
 
 export const AffiliatePage: React.FC<AffiliatePageProps> = ({ onSearchClick, onContactClick }) => {
-  // Form State
+  // Active workflow tab: 'submit' (Upload Document) or 'register' (Affiliate Application)
+  const [workflowTab, setWorkflowTab] = useState<'submit' | 'register'>('submit');
+
+  // Document Upload Form State
+  const [docFile, setDocFile] = useState<File | null>(null);
+  const [docTitle, setDocTitle] = useState('');
+  const [docUnitCode, setDocUnitCode] = useState('');
+  const [docCategory, setDocCategory] = useState('Past Examination Papers');
+  const [docAcademicLevel, setDocAcademicLevel] = useState('Undergraduate Degree');
+  const [docUniversity, setDocUniversity] = useState('Mount Kenya University (MKU)');
+  const [docDescription, setDocDescription] = useState('');
+  const [docAffiliateName, setDocAffiliateName] = useState('');
+  const [docAffiliateEmail, setDocAffiliateEmail] = useState('');
+  const [docAffiliatePhone, setDocAffiliatePhone] = useState('');
+  const [isSubmittingDoc, setIsSubmittingDoc] = useState(false);
+  const [docSubmitError, setDocSubmitError] = useState('');
+  const [docSubmissionResult, setDocSubmissionResult] = useState<{
+    referenceCode: string;
+    title: string;
+    createdAt: string;
+    status: string;
+  } | null>(null);
+  const [copiedRef, setCopiedRef] = useState(false);
+
+  // Registration Form State
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState('');
@@ -87,6 +115,69 @@ export const AffiliatePage: React.FC<AffiliatePageProps> = ({ onSearchClick, onC
     'Daystar University',
     'Other Institution',
   ];
+
+  const handleSubmitDocument = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setDocSubmitError('');
+
+    if (!docFile) {
+      setDocSubmitError('Please attach a document file (PDF or Word, max 50MB).');
+      return;
+    }
+    if (!docTitle.trim()) {
+      setDocSubmitError('Paper title is required.');
+      return;
+    }
+    if (!docUnitCode.trim()) {
+      setDocSubmitError('Unit code / course code is required.');
+      return;
+    }
+    if (!docAffiliateName.trim() || !docAffiliateEmail.trim() || !docAffiliatePhone.trim()) {
+      setDocSubmitError('Please provide your name, email address, and phone / WhatsApp number.');
+      return;
+    }
+
+    setIsSubmittingDoc(true);
+
+    try {
+      const formData = new FormData();
+      formData.append('documentFile', docFile);
+      formData.append('paper_title', docTitle.trim());
+      formData.append('unit_code', docUnitCode.trim().toUpperCase());
+      formData.append('category', docCategory);
+      formData.append('academic_level', docAcademicLevel);
+      formData.append('affiliate_university', docUniversity);
+      formData.append('description', docDescription.trim());
+      formData.append('affiliate_name', docAffiliateName.trim());
+      formData.append('affiliate_email', docAffiliateEmail.trim());
+      formData.append('affiliate_phone', docAffiliatePhone.trim());
+
+      const res = await fetch('/api/affiliate/submissions', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        setDocSubmitError(data.error || 'Failed to submit document. Please check your details and try again.');
+        setIsSubmittingDoc(false);
+        return;
+      }
+
+      setDocSubmissionResult({
+        referenceCode: data.submission.reference_code,
+        title: data.submission.paper_title,
+        createdAt: data.submission.created_at,
+        status: data.submission.status,
+      });
+      setIsSubmittingDoc(false);
+    } catch (err: any) {
+      console.error('Doc submission error:', err);
+      setDocSubmitError(err.message || 'Network error occurred while uploading. Please try again.');
+      setIsSubmittingDoc(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -282,20 +373,25 @@ export const AffiliatePage: React.FC<AffiliatePageProps> = ({ onSearchClick, onC
           <div className="flex flex-col sm:flex-row items-center gap-4 mt-10 w-full sm:w-auto">
             <button
               onClick={() => {
-                setIsRegisterOpen(true);
-                document.getElementById('register-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                setWorkflowTab('submit');
+                document.getElementById('affiliate-workflow-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
               }}
               className="w-full sm:w-auto px-8 py-3.5 rounded-full bg-[#00D26A] hover:bg-[#00b85c] text-slate-950 font-black text-sm sm:text-base transition-all flex items-center justify-center gap-2 shadow-lg shadow-[#00D26A]/20"
             >
-              Become a Partner <span className="text-xl leading-none -mt-0.5">→</span>
+              <UploadCloud className="w-5 h-5 text-slate-950" />
+              <span>Submit Past Papers</span>
+              <span className="text-xl leading-none -mt-0.5">→</span>
             </button>
             <button
               onClick={() => {
-                document.getElementById('features-section')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                setWorkflowTab('register');
+                setIsRegisterOpen(true);
+                document.getElementById('affiliate-workflow-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
               }}
               className="w-full sm:w-auto px-8 py-3.5 rounded-full bg-[#01140b] hover:bg-white/10 text-white border border-[#00E588]/40 font-bold text-sm sm:text-base transition-all flex items-center justify-center gap-2 backdrop-blur-sm"
             >
-              Learn More <span className="text-lg leading-none -mt-0.5">▷</span>
+              <span>Partner Registration</span>
+              <span className="text-lg leading-none -mt-0.5">▷</span>
             </button>
           </div>
         </div>
@@ -372,10 +468,419 @@ export const AffiliatePage: React.FC<AffiliatePageProps> = ({ onSearchClick, onC
         </div>
       </section>
 
-      <div className="space-y-12 max-w-7xl mx-auto pt-16 px-4 sm:px-6">
-        {/* 4. HIDDEN REGISTRATION FORM DROPDOWN (ACCORDION) */}
-        <section id="register-section" className="max-w-3xl mx-auto px-4 w-full">
-          <div className="w-full bg-gradient-to-b from-[#02180e] to-[#01140b] rounded-3xl border border-[#00D26A]/30 shadow-2xl overflow-hidden">
+      <div className="space-y-8 max-w-7xl mx-auto pt-16 px-4 sm:px-6">
+        {/* Workflow Section Header & Tab Selector */}
+        <section id="affiliate-workflow-section" className="max-w-4xl mx-auto px-4 w-full space-y-6">
+          <div className="flex items-center justify-center p-1.5 bg-[#02180e] border border-[#00D26A]/30 rounded-2xl max-w-md mx-auto shadow-lg">
+            <button
+              type="button"
+              onClick={() => setWorkflowTab('submit')}
+              className={`flex-1 py-2.5 px-4 rounded-xl font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                workflowTab === 'submit'
+                  ? 'bg-[#00D26A] text-slate-950 shadow-md shadow-[#00D26A]/20'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              <UploadCloud className="w-4 h-4" />
+              <span>Submit Papers</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setWorkflowTab('register');
+                setIsRegisterOpen(true);
+              }}
+              className={`flex-1 py-2.5 px-4 rounded-xl font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                workflowTab === 'register'
+                  ? 'bg-[#00D26A] text-slate-950 shadow-md shadow-[#00D26A]/20'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              <Briefcase className="w-4 h-4" />
+              <span>Partner Registration</span>
+            </button>
+          </div>
+
+          {/* TAB 1: DOCUMENT SUBMISSION FORM */}
+          {workflowTab === 'submit' && (
+            <div className="w-full bg-gradient-to-b from-[#02180e] to-[#01140b] rounded-3xl border border-[#00D26A]/30 shadow-2xl overflow-hidden animate-fadeIn">
+              <div className="px-6 py-6 border-b border-white/10 flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 rounded-2xl bg-[#00D26A] text-slate-950 flex items-center justify-center shadow-lg shadow-[#00D26A]/40">
+                    <UploadCloud className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h2 className="text-xl sm:text-2xl font-black text-white tracking-tight">
+                      Submit Past Paper Document
+                    </h2>
+                    <p className="text-xs sm:text-sm text-[#a1cbb2]">
+                      Upload PDF/Word document for editorial review and monetization
+                    </p>
+                  </div>
+                </div>
+                <div className="hidden sm:flex items-center gap-2 bg-[#00D26A]/10 border border-[#00D26A]/30 text-[#00D26A] text-xs font-bold px-3 py-1.5 rounded-full">
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>Host Staged Review</span>
+                </div>
+              </div>
+
+              <div className="p-4 sm:p-8 bg-white text-slate-900">
+                {/* Confirmation Modal / Screen */}
+                {docSubmissionResult ? (
+                  <div className="space-y-6 py-4 animate-fadeIn text-slate-900 max-w-lg mx-auto">
+                    <div className="w-16 h-16 rounded-full bg-emerald-100 text-[#00D26A] flex items-center justify-center mx-auto border-2 border-emerald-300 shadow-sm">
+                      <CheckCircle2 className="w-8 h-8 stroke-[2.5]" />
+                    </div>
+
+                    <div className="text-center space-y-1">
+                      <h3 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight">
+                        Document Submitted Successfully!
+                      </h3>
+                      <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
+                        Your paper has been delivered to our administrative review desk and an automated notification has been dispatched to the host email inbox.
+                      </p>
+                    </div>
+
+                    {/* Staged Alert */}
+                    <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 text-xs text-amber-900 flex items-start gap-3">
+                      <Clock className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                      <div className="leading-relaxed">
+                        <strong>Pending Administrator Review:</strong> This document is staged in the review queue. It will become part of the official Papers Database once an authorized administrator verifies the content and approves it.
+                      </div>
+                    </div>
+
+                    {/* Reference Card */}
+                    <div className="bg-slate-50 border border-slate-200 rounded-2xl p-5 space-y-3 text-xs sm:text-sm">
+                      <div className="flex items-center justify-between pb-3 border-b border-slate-200">
+                        <span className="font-semibold text-slate-500">Submission Reference:</span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-black bg-emerald-100 text-emerald-950 px-2.5 py-1 rounded-lg border border-emerald-300">
+                            {docSubmissionResult.referenceCode}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(docSubmissionResult.referenceCode);
+                              setCopiedRef(true);
+                              setTimeout(() => setCopiedRef(false), 2000);
+                            }}
+                            className="p-1 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-200 transition-colors"
+                            title="Copy Reference"
+                          >
+                            {copiedRef ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-slate-500">Paper Title:</span>
+                        <span className="font-bold text-slate-900 text-right max-w-[60%] truncate">
+                          {docSubmissionResult.title}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-slate-500">Status:</span>
+                        <span className="font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded text-xs">
+                          Pending Admin Review
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-slate-500">Timestamp:</span>
+                        <span className="text-slate-600 font-mono text-xs">
+                          {new Date(docSubmissionResult.createdAt).toLocaleDateString([], {
+                            month: 'short',
+                            day: 'numeric',
+                            year: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+                      <a
+                        href={`https://wa.me/254115382332?text=${encodeURIComponent(
+                          `Hello Godrery Team, I submitted document ${docSubmissionResult.referenceCode} (${docSubmissionResult.title}) for review.`
+                        )}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="w-full sm:w-auto flex-1 px-5 py-3 rounded-xl bg-[#00D26A] hover:bg-[#00b85c] text-slate-950 font-black text-sm flex items-center justify-center gap-2 transition-all shadow-md shadow-[#00D26A]/20"
+                      >
+                        <MessageSquare className="w-4 h-4" />
+                        <span>Follow up on WhatsApp</span>
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDocSubmissionResult(null);
+                          setDocFile(null);
+                          setDocTitle('');
+                          setDocUnitCode('');
+                          setDocDescription('');
+                        }}
+                        className="w-full sm:w-auto px-5 py-3 rounded-xl border border-slate-300 hover:bg-slate-100 text-slate-700 font-bold text-sm transition-all cursor-pointer"
+                      >
+                        Submit Another Paper
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <form onSubmit={handleSubmitDocument} className="space-y-6">
+                    {docSubmitError && (
+                      <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold flex items-center gap-2">
+                        <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
+                        <span>{docSubmitError}</span>
+                      </div>
+                    )}
+
+                    {/* 1. File Upload Dropzone */}
+                    <div className="space-y-2">
+                      <label className="block text-xs font-black uppercase tracking-wider text-slate-700">
+                        1. Document Attachment (PDF or Word, Max 50MB) <span className="text-rose-500">*</span>
+                      </label>
+                      <div
+                        onClick={() => document.getElementById('affiliate-file-input')?.click()}
+                        className={`border-2 border-dashed rounded-2xl p-6 text-center cursor-pointer transition-all ${
+                          docFile
+                            ? 'border-[#00D26A] bg-emerald-50/50'
+                            : 'border-slate-300 hover:border-[#00D26A] hover:bg-slate-50'
+                        }`}
+                      >
+                        <input
+                          type="file"
+                          id="affiliate-file-input"
+                          accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                          onChange={(e) => {
+                            if (e.target.files && e.target.files[0]) {
+                              const f = e.target.files[0];
+                              if (f.size > 50 * 1024 * 1024) {
+                                setDocSubmitError('File size exceeds maximum 50MB limit.');
+                                return;
+                              }
+                              setDocFile(f);
+                              setDocSubmitError('');
+                              // Auto-fill title from filename if empty
+                              if (!docTitle) {
+                                const cleanName = f.name.replace(/\.[^/.]+$/, '').replace(/[_\\-]/g, ' ');
+                                setDocTitle(cleanName);
+                              }
+                            }
+                          }}
+                          className="hidden"
+                        />
+
+                        {docFile ? (
+                          <div className="space-y-2 flex flex-col items-center">
+                            <div className="w-12 h-12 rounded-full bg-[#00D26A]/20 text-[#00D26A] flex items-center justify-center">
+                              <FileText className="w-6 h-6" />
+                            </div>
+                            <div className="font-bold text-slate-900 text-sm max-w-sm truncate">
+                              {docFile.name}
+                            </div>
+                            <div className="text-xs text-slate-500">
+                              {(docFile.size / (1024 * 1024)).toFixed(2)} MB &nbsp;•&nbsp; Click to change file
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="space-y-2 flex flex-col items-center">
+                            <div className="w-12 h-12 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center">
+                              <UploadCloud className="w-6 h-6 text-slate-500" />
+                            </div>
+                            <div className="text-sm font-bold text-slate-800">
+                              Click or Drag &amp; Drop Paper Document Here
+                            </div>
+                            <p className="text-xs text-slate-500">
+                              Accepts PDF, DOC, DOCX files up to 50MB
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* 2. Paper Metadata */}
+                    <div className="space-y-4 pt-2">
+                      <h3 className="text-xs font-black uppercase tracking-wider text-slate-400">
+                        2. Paper &amp; Examination Details
+                      </h3>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div className="space-y-1">
+                          <label className="block text-xs font-bold text-slate-700">
+                            Unit / Course Code <span className="text-rose-500">*</span>
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            value={docUnitCode}
+                            onChange={(e) => setDocUnitCode(e.target.value.toUpperCase())}
+                            placeholder="e.g. BDS3208, BIT3101, BMA1102"
+                            className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm uppercase outline-none transition-all"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-xs font-bold text-slate-700">
+                            Paper Title <span className="text-rose-500">*</span>
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            value={docTitle}
+                            onChange={(e) => setDocTitle(e.target.value)}
+                            placeholder="e.g. Oral Pathology I Examination Paper 2018/2019"
+                            className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                        <div className="space-y-1">
+                          <label className="block text-xs font-bold text-slate-700">
+                            Category / Field
+                          </label>
+                          <select
+                            value={docCategory}
+                            onChange={(e) => setDocCategory(e.target.value)}
+                            className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all bg-white"
+                          >
+                            <option value="Past Examination Papers">Past Examination Papers</option>
+                            <option value="Medical Sciences">Medical Sciences</option>
+                            <option value="Computer Science & IT">Computer Science &amp; IT</option>
+                            <option value="Business & Economics">Business &amp; Economics</option>
+                            <option value="Engineering & Technology">Engineering &amp; Technology</option>
+                            <option value="Law & Legal Studies">Law &amp; Legal Studies</option>
+                            <option value="Education & Social Sciences">Education &amp; Social Sciences</option>
+                            <option value="Marking Scheme">Marking Scheme</option>
+                          </select>
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-xs font-bold text-slate-700">
+                            Academic Level
+                          </label>
+                          <select
+                            value={docAcademicLevel}
+                            onChange={(e) => setDocAcademicLevel(e.target.value)}
+                            className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all bg-white"
+                          >
+                            <option value="Undergraduate Degree">Undergraduate Degree</option>
+                            <option value="Diploma">Diploma</option>
+                            <option value="Certificate">Certificate</option>
+                            <option value="Postgraduate / Masters">Postgraduate / Masters</option>
+                          </select>
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-xs font-bold text-slate-700">
+                            University / College
+                          </label>
+                          <select
+                            value={docUniversity}
+                            onChange={(e) => setDocUniversity(e.target.value)}
+                            className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all bg-white"
+                          >
+                            {universitiesList.map((u) => (
+                              <option key={u} value={u}>
+                                {u}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="block text-xs font-bold text-slate-700">
+                          Description or Notes for Editor
+                        </label>
+                        <textarea
+                          rows={2}
+                          value={docDescription}
+                          onChange={(e) => setDocDescription(e.target.value)}
+                          placeholder="Optional notes: exam year, trimester, lecturer name, or marking points included..."
+                          className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all resize-none"
+                        />
+                      </div>
+                    </div>
+
+                    {/* 3. Contributor Contact Details */}
+                    <div className="space-y-4 pt-2">
+                      <h3 className="text-xs font-black uppercase tracking-wider text-slate-400">
+                        3. Contributor Contact (For Payouts &amp; Approval Alert)
+                      </h3>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                        <div className="space-y-1">
+                          <label className="block text-xs font-bold text-slate-700">
+                            Your Full Name <span className="text-rose-500">*</span>
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            value={docAffiliateName}
+                            onChange={(e) => setDocAffiliateName(e.target.value)}
+                            placeholder="e.g. Kelvin Mutua"
+                            className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-xs font-bold text-slate-700">
+                            Email Address <span className="text-rose-500">*</span>
+                          </label>
+                          <input
+                            type="email"
+                            required
+                            value={docAffiliateEmail}
+                            onChange={(e) => setDocAffiliateEmail(e.target.value)}
+                            placeholder="e.g. student@gmail.com"
+                            className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-xs font-bold text-slate-700">
+                            Phone / WhatsApp (M-Pesa) <span className="text-rose-500">*</span>
+                          </label>
+                          <input
+                            type="tel"
+                            required
+                            value={docAffiliatePhone}
+                            onChange={(e) => setDocAffiliatePhone(e.target.value)}
+                            placeholder="e.g. 0712345678"
+                            className="w-full px-4 py-3 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Submit Button */}
+                    <button
+                      type="submit"
+                      disabled={isSubmittingDoc}
+                      className="w-full py-4 px-6 bg-[#00D26A] hover:bg-[#00b85c] disabled:bg-emerald-800 text-slate-950 font-black rounded-xl transition-all shadow-md shadow-[#00D26A]/20 flex items-center justify-center gap-2 text-sm sm:text-base active:scale-[0.99] cursor-pointer disabled:cursor-not-allowed"
+                    >
+                      {isSubmittingDoc ? (
+                        <span>Uploading &amp; Dispatching to Host Desk...</span>
+                      ) : (
+                        <>
+                          <UploadCloud className="w-5 h-5" />
+                          <span>Submit Document For Review</span>
+                        </>
+                      )}
+                    </button>
+                  </form>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* TAB 2: PRELIMINARY REGISTRATION ACCORDION */}
+          {workflowTab === 'register' && (
+          <div className="w-full bg-gradient-to-b from-[#02180e] to-[#01140b] rounded-3xl border border-[#00D26A]/30 shadow-2xl overflow-hidden animate-fadeIn">
             
             <button 
               onClick={() => setIsRegisterOpen(!isRegisterOpen)}
@@ -752,6 +1257,7 @@ export const AffiliatePage: React.FC<AffiliatePageProps> = ({ onSearchClick, onC
               )}
             </AnimatePresence>
           </div>
+          )}
         </section>
 
         {/* Support / Inquiries Footer Bar */}

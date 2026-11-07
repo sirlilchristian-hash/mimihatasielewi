@@ -32,6 +32,11 @@ const SECTION_METADATA: Record<AdminSection, { title: string; category: string; 
     category: 'Content',
     description: 'Repository management, upload new PDF papers, and update availability status',
   },
+  affiliate_submissions: {
+    title: 'Affiliate Paper Submissions',
+    category: 'Content',
+    description: 'Review staged documents from affiliates, inspect metadata, and push approved papers to database',
+  },
   paper_sellers: {
     title: 'Affiliate Paper Sellers',
     category: 'Content',

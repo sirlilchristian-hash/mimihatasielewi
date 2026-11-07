@@ -15,6 +15,7 @@ import {
   LogOut,
   Building2,
   X,
+  UploadCloud,
 } from 'lucide-react';
 import { AdminSection } from './adminTypes';
 
@@ -163,7 +164,8 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({
             <div className="px-3 py-1 text-[10px] font-bold tracking-wider text-slate-500 uppercase">
               Content
             </div>
-            {renderNavButton('papers', 'Papers', BookOpen)}
+            {renderNavButton('papers', 'Papers Database', BookOpen)}
+            {renderNavButton('affiliate_submissions', 'Affiliate Submissions', UploadCloud)}
             {renderNavButton('paper_sellers', 'Paper Sellers', Users2)}
           </div>
 

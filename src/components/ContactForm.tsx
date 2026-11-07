@@ -98,9 +98,14 @@ export const ContactForm: React.FC<ContactFormProps> = ({ initialUnitQuery, onSu
     }
 
     setIsSubmitting(true);
+    setErrors((prev) => {
+      const copy = { ...prev };
+      delete copy.submit;
+      return copy;
+    });
 
     try {
-      const res = await fetch('/api/messages', {
+      let res = await fetch('/api/contact', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -109,9 +114,23 @@ export const ContactForm: React.FC<ContactFormProps> = ({ initialUnitQuery, onSu
           phone: formData.phone,
           subject: formData.subject,
           message: formData.message,
-          isRead: false
         })
       });
+
+      if (!res.ok) {
+        // Fallback to /api/messages
+        res = await fetch('/api/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fullName: formData.fullName,
+            email: formData.email,
+            phone: formData.phone,
+            subject: formData.subject,
+            message: formData.message,
+          })
+        });
+      }
 
       if (res.ok) {
         setIsSubmitting(false);
@@ -124,11 +143,19 @@ export const ContactForm: React.FC<ContactFormProps> = ({ initialUnitQuery, onSu
           });
         }
       } else {
-         console.error('Failed to submit message');
-         setIsSubmitting(false);
+        const errorData = await res.json().catch(() => ({}));
+        setErrors((prev) => ({
+          ...prev,
+          submit: errorData.error || 'Failed to send message. Please try again or reach us via WhatsApp.',
+        }));
+        setIsSubmitting(false);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      setErrors((prev) => ({
+        ...prev,
+        submit: err.message || 'Network error occurred. Please try again.',
+      }));
       setIsSubmitting(false);
     }
   };
@@ -189,6 +216,12 @@ export const ContactForm: React.FC<ContactFormProps> = ({ initialUnitQuery, onSu
 
       {/* Form Element */}
       <form onSubmit={handleSubmit} className="space-y-5">
+        {errors.submit && (
+          <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
+            <span>{errors.submit}</span>
+          </div>
+        )}
         {/* Row 1: Full Name & Email Address */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-5">
           {/* Full Name */}

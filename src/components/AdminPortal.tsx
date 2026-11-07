@@ -45,6 +45,7 @@ import { AdminPaperEditModal } from './admin/AdminPaperEditModal';
 import { AdminPaperViewerModal } from './admin/AdminPaperViewerModal';
 import { AdminDownloadPaperModal } from './admin/AdminDownloadPaperModal';
 import { AdminBulkOcrModal } from './admin/AdminBulkOcrModal';
+import { AdminAffiliateSubmissionsView } from './admin/AdminAffiliateSubmissionsView';
 
 // Re-export types for backward compatibility
 export type { Paper, ExamPaperAdminItem, TransactionRecord, DeviceRequest };
@@ -125,6 +126,22 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   // Settings State
   const [currentAdminPin, setCurrentAdminPin] = useState<string>('');
   const [defaultPrice, setDefaultPrice] = useState<string>('50');
+  const [reviewSubmissionId, setReviewSubmissionId] = useState<string | null>(null);
+
+  // Check URL query parameters for deep linking (e.g. ?review=<submissionId> or ?section=affiliate_submissions)
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const reviewParam = params.get('review') || params.get('reviewSubmission');
+      const sectionParam = params.get('section');
+      if (reviewParam) {
+        setReviewSubmissionId(reviewParam);
+        setActiveSection('affiliate_submissions');
+      } else if (sectionParam === 'affiliate_submissions') {
+        setActiveSection('affiliate_submissions');
+      }
+    }
+  }, [isOpen]);
 
   // Verify administrator session authoritatively on mount or when portal opens
   useEffect(() => {
@@ -787,6 +804,16 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
               }}
               isRefreshing={isRefreshingAll}
               onOpenBulkModal={() => setIsBulkModalOpen(true)}
+            />
+          )}
+
+          {activeSection === 'affiliate_submissions' && (
+            <AdminAffiliateSubmissionsView
+              adminRole={adminRole}
+              initialSelectedId={reviewSubmissionId}
+              onPaperPushed={async () => {
+                if (onRefreshPapers) await onRefreshPapers();
+              }}
             />
           )}
 
